@@ -69,8 +69,18 @@ struct pcm_runtime {
 	uint8_t rate; /* one of PCM_RATE_XXX */
 };
 
-static const int rates[] = { 44100, 48000, 88200, 96000 };
-static const int rates_alsaid[] = {	SNDRV_PCM_RATE_44100, SNDRV_PCM_RATE_48000,	SNDRV_PCM_RATE_88200, SNDRV_PCM_RATE_96000 };
+static const int rates[] = {
+	44100,
+	48000,
+	88200,
+	96000
+};
+static const int rates_alsaid[] = {
+	SNDRV_PCM_RATE_44100,
+	SNDRV_PCM_RATE_48000,
+	SNDRV_PCM_RATE_88200,
+	SNDRV_PCM_RATE_96000,
+};
 
 static const struct snd_pcm_hardware pcm_hw = {
 	.info = SNDRV_PCM_INFO_MMAP |
