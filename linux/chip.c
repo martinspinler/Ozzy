@@ -43,6 +43,7 @@ static struct xonedb4_drvdata drvdata_default = {
 
 static struct xonedb4_drvdata drvdata_alesis8 = {
 	.have_midi = 0,
+	.isoc_out_packets = 40,
 };
 
 int xonedb4_get_firmware_ver(struct xonedb4_chip *chip)
