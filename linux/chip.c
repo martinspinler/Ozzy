@@ -37,6 +37,10 @@ bool justresetting = false;
 
 static DEFINE_MUTEX(register_mutex);
 
+static struct xonedb4_drvdata drvdata_default = {
+	.have_midi = 1,
+};
+
 int xonedb4_get_firmware_ver(struct xonedb4_chip *chip)
 {
 	int ret;
@@ -244,10 +248,12 @@ static int xonedb4_probe(struct usb_interface *intf, const struct usb_device_id 
 			goto err_chip_destroy;
 		}
 
-		ret = xonedb4_midi_init_bulk_urbs(chip);
-		if (ret < 0) {
-			dev_err(&device->dev, "%s: MIDI fail!\n", __func__);
-			goto err_chip_destroy;
+		if (chip->cfg->have_midi) {
+			ret = xonedb4_midi_init_bulk_urbs(chip);
+			if (ret < 0) {
+				dev_err(&device->dev, "%s: MIDI fail!\n", __func__);
+				goto err_chip_destroy;
+			}
 		}
 		ret = xonedb4_pcm_init_urbs(chip);
 		if (ret < 0) {
@@ -293,6 +299,10 @@ static int xonedb4_probe(struct usb_interface *intf, const struct usb_device_id 
 	chip = card->private_data;
 	chip->card = card;
 	chip->dev = device;
+	if (usb_id->driver_info)
+		chip->cfg = (struct xonedb4_drvdata *)usb_id->driver_info;
+	else
+		chip->cfg = &drvdata_default;
 
 	chip->alsarate = 3;
 
@@ -340,9 +350,11 @@ static int xonedb4_probe(struct usb_interface *intf, const struct usb_device_id 
 		dev_err(&device->dev, "%s: PCM fail!\n", __func__);
 		goto err_chip_destroy;
 	}
-	ret = xonedb4_midi_init(chip);
-	if (ret < 0) {
-		goto err_chip_destroy;
+	if (chip->cfg->have_midi) {
+		ret = xonedb4_midi_init(chip);
+		if (ret < 0) {
+			goto err_chip_destroy;
+		}
 	}
 	ret = snd_card_register(chip->card);
 	if (ret < 0) {
@@ -378,7 +390,8 @@ static void xonedb4_disconnect(struct usb_interface *intf)
 
 	/* Make sure that the userspace cannot create new request */
 	xonedb4_pcm_abort(chip);
-	xonedb4_midi_abort(chip);
+	if (chip->cfg->have_midi)
+		xonedb4_midi_abort(chip);
 	if (justresetting == false) {
 		snd_card_disconnect(chip->card);
 		snd_card_free_when_closed(chip->card);

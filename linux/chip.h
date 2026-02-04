@@ -6,6 +6,10 @@
 
 struct pcm_runtime;
 
+struct xonedb4_drvdata {
+	int have_midi;
+};
+
 struct xonedb4_chip {
 	unsigned char firmwarever[15];
 	unsigned char sampleratebytes[3];
@@ -17,6 +21,7 @@ struct xonedb4_chip {
 	struct snd_card *card;
 	struct pcm_runtime *pcm;
 	struct midi_runtime *midi;
+	struct xonedb4_drvdata *cfg;
 };
 
 int xonedb4_get_firmware_ver(struct xonedb4_chip *chip);
