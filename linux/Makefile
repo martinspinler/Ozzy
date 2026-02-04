@@ -17,8 +17,8 @@ PWD := $(shell pwd)
 obj-m := $(MODULE_NAME).o
 
 # Source files: Local driver files + Common library
-# Note: We link ../common/ploytec.o relative to this directory
-$(MODULE_NAME)-y := chip.o pcm.o midi.o ../common/ploytec.o
+# Note: We link ../legacy/common/ploytec.o relative to this directory
+$(MODULE_NAME)-y := chip.o pcm.o midi.o ../legacy/common/ploytec.o
 
 # ------------------------------------------
 #  Targets
