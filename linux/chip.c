@@ -41,6 +41,10 @@ static struct xonedb4_drvdata drvdata_default = {
 	.have_midi = 1,
 };
 
+static struct xonedb4_drvdata drvdata_alesis8 = {
+	.have_midi = 0,
+};
+
 int xonedb4_get_firmware_ver(struct xonedb4_chip *chip)
 {
 	int ret;
@@ -428,6 +432,13 @@ static const struct usb_device_id device_table[] = {
 		.match_flags = USB_DEVICE_ID_MATCH_DEVICE,
 		.idVendor = 0x0a4a,
 		.idProduct = 0xffad
+	},
+	// Alesis MultiMix 8
+	{
+		.match_flags = USB_DEVICE_ID_MATCH_DEVICE,
+		.idVendor = 0x13b2,
+		.idProduct = 0x0030,
+		.driver_info = (uintptr_t)&drvdata_alesis8,
 	},
 	{}
 };
