@@ -939,7 +939,7 @@ int xonedb4_pcm_init_urbs(struct xonedb4_chip *chip)
 	
 	return 0;
 
-	error:
+error:
 	dev_err(&chip->dev->dev, "%s: ERROR\n", __func__);
 	mutex_unlock(&rt->stream_mutex);
 	for (i = 0; i < PCM_N_URBS; i++)
@@ -989,7 +989,7 @@ int xonedb4_pcm_init(struct xonedb4_chip *chip)
 
 	return 0;
 
-	error:
+error:
 	dev_err(&chip->dev->dev, "%s: ERROR\n", __func__);
 	kfree(rt);
 	return ret;

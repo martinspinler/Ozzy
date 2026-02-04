@@ -191,7 +191,7 @@ static int xonedb4_probe(struct usb_interface *intf, const struct usb_device_id 
 	}
 	
 	int i;
-    int ret;
+	int ret;
 	struct usb_device *device = interface_to_usbdev(intf);
 
 	ret = usb_set_interface(device, 0, 1);
@@ -410,12 +410,12 @@ static const struct usb_device_id device_table[] = {
 		.idVendor = 0x0a4a,
 		.idProduct = 0xff4d
 	},
-        // Allen&Heath Wizard 4
-        {
-                .match_flags = USB_DEVICE_ID_MATCH_DEVICE,
-                .idVendor = 0x0a4a,
-                .idProduct = 0xffad
-        },
+	// Allen&Heath Wizard 4
+	{
+		.match_flags = USB_DEVICE_ID_MATCH_DEVICE,
+		.idVendor = 0x0a4a,
+		.idProduct = 0xffad
+	},
 	{}
 };
 
