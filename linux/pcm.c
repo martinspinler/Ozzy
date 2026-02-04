@@ -31,7 +31,7 @@
 
 struct pcm_urb {
 	struct xonedb4_chip *chip;
-	struct urb instance;
+	struct urb *instance;
 	struct usb_anchor submitted;
 	uint8_t *buffer;
 };
@@ -147,8 +147,8 @@ static void xonedb4_pcm_kill_urbs(struct pcm_runtime *rt)
 		if (!time) {
 			usb_kill_anchored_urbs(&rt->pcm_out_urbs[i].submitted);
 		}
-		usb_kill_urb(&rt->pcm_in_urbs[i].instance);
-		usb_kill_urb(&rt->pcm_out_urbs[i].instance);
+		usb_kill_urb(rt->pcm_in_urbs[i].instance);
+		usb_kill_urb(rt->pcm_out_urbs[i].instance);
 	}
 }
 
@@ -165,8 +165,8 @@ static void xonedb4_pcm_poison_urbs(struct pcm_runtime *rt)
 		if (!time) {
 			usb_kill_anchored_urbs(&rt->pcm_out_urbs[i].submitted);
 		}
-		usb_poison_urb(&rt->pcm_in_urbs[i].instance);
-		usb_poison_urb(&rt->pcm_out_urbs[i].instance);
+		usb_poison_urb(rt->pcm_in_urbs[i].instance);
+		usb_poison_urb(rt->pcm_out_urbs[i].instance);
 	}
 }
 
@@ -478,7 +478,7 @@ static void xonedb4_pcm_in_urb_handler(struct urb *usb_urb)
 		snd_pcm_period_elapsed(sub->instance);
 	}
 
-	ret = usb_submit_urb(&in_urb->instance, GFP_ATOMIC);
+	ret = usb_submit_urb(in_urb->instance, GFP_ATOMIC);
 
 	if (ret < 0)
 		goto in_fail;
@@ -528,7 +528,7 @@ static void xonedb4_pcm_bulk_out_urb_handler(struct urb *usb_urb)
 	xonedb4_get_midi_output(out_urb->buffer + 1504, 1);
 	xonedb4_get_midi_output(out_urb->buffer + 2016, 1);
 
-	ret = usb_submit_urb(&out_urb->instance, GFP_ATOMIC);
+	ret = usb_submit_urb(out_urb->instance, GFP_ATOMIC);
 
 	if (ret < 0)
 		goto out_fail;
@@ -579,7 +579,7 @@ static void xonedb4_pcm_int_out_urb_handler(struct urb *usb_urb)
 	xonedb4_get_midi_output(out_urb->buffer + 1396, 2);
 	xonedb4_get_midi_output(out_urb->buffer + 1878, 2);
 
-	ret = usb_submit_urb(&out_urb->instance, GFP_ATOMIC);
+	ret = usb_submit_urb(out_urb->instance, GFP_ATOMIC);
 	
 	if (ret < 0)
 		goto out_fail;
@@ -773,7 +773,7 @@ static const struct snd_pcm_ops pcm_ops = {
 static int xonedb4_pcm_init_bulk_out_urbs(struct pcm_urb *urb, struct xonedb4_chip *chip, unsigned int ep, void (*handler)(struct urb *))
 {
 	urb->chip = chip;
-	usb_init_urb(&urb->instance);
+	usb_init_urb(urb->instance);
 
 	urb->buffer = kzalloc(XDB4_PCM_BULK_OUT_PACKET_SIZE, GFP_KERNEL);
 	if (!urb->buffer) {
@@ -797,8 +797,8 @@ static int xonedb4_pcm_init_bulk_out_urbs(struct pcm_urb *urb, struct xonedb4_ch
 	memset(urb->buffer + 2017, 0xff, 1);
 	memset(urb->buffer + 2018, 0, 30);
 
-	usb_fill_bulk_urb(&urb->instance, chip->dev, usb_sndbulkpipe(chip->dev, ep), (void *)urb->buffer, XDB4_PCM_BULK_OUT_PACKET_SIZE, handler, urb);
-	if (usb_urb_ep_type_check(&urb->instance)) {
+	usb_fill_bulk_urb(urb->instance, chip->dev, usb_sndbulkpipe(chip->dev, ep), (void *)urb->buffer, XDB4_PCM_BULK_OUT_PACKET_SIZE, handler, urb);
+	if (usb_urb_ep_type_check(urb->instance)) {
 		dev_err(&chip->dev->dev, "%s: Sanity check failed!\n", __func__);
 		return -EINVAL;
 	}
@@ -811,7 +811,7 @@ static int xonedb4_pcm_init_bulk_out_urbs(struct pcm_urb *urb, struct xonedb4_ch
 static int xonedb4_pcm_init_int_out_urbs(struct pcm_urb *urb, struct xonedb4_chip *chip, unsigned int ep, void (*handler)(struct urb *))
 {
 	urb->chip = chip;
-	usb_init_urb(&urb->instance);
+	usb_init_urb(urb->instance);
 
 	urb->buffer = kzalloc(XDB4_PCM_INT_OUT_PACKET_SIZE, GFP_KERNEL);
 	if (!urb->buffer) {
@@ -828,8 +828,8 @@ static int xonedb4_pcm_init_int_out_urbs(struct pcm_urb *urb, struct xonedb4_chi
 	xonedb4_get_midi_output(urb->buffer + 1878, 2);
 	memset(urb->buffer + 1880, 0, 48);
 
-	usb_fill_int_urb(&urb->instance, chip->dev, usb_sndintpipe(chip->dev, ep), (void *)urb->buffer, XDB4_PCM_INT_OUT_PACKET_SIZE, handler, urb, chip->dev->ep_out[PCM_OUT_EP]->desc.bInterval);
-	if (usb_urb_ep_type_check(&urb->instance)) {
+	usb_fill_int_urb(urb->instance, chip->dev, usb_sndintpipe(chip->dev, ep), (void *)urb->buffer, XDB4_PCM_INT_OUT_PACKET_SIZE, handler, urb, chip->dev->ep_out[PCM_OUT_EP]->desc.bInterval);
+	if (usb_urb_ep_type_check(urb->instance)) {
 		dev_err(&chip->dev->dev, "%s: Sanity check failed!\n", __func__);
 		return -EINVAL;
 	}
@@ -842,15 +842,15 @@ static int xonedb4_pcm_init_int_out_urbs(struct pcm_urb *urb, struct xonedb4_chi
 static int xonedb4_pcm_init_bulk_in_urbs(struct pcm_urb *urb, struct xonedb4_chip *chip, unsigned int ep, void (*handler)(struct urb *))
 {
 	urb->chip = chip;
-	usb_init_urb(&urb->instance);
+	usb_init_urb(urb->instance);
 
 	urb->buffer = kzalloc(XDB4_PCM_IN_PACKET_SIZE, GFP_KERNEL);
 	if (!urb->buffer) {
 		return -ENOMEM;
 	}
 
-	usb_fill_bulk_urb(&urb->instance, chip->dev, usb_rcvbulkpipe(chip->dev, ep), (void *)urb->buffer, XDB4_PCM_IN_PACKET_SIZE, handler, urb);
-	if (usb_urb_ep_type_check(&urb->instance)) {
+	usb_fill_bulk_urb(urb->instance, chip->dev, usb_rcvbulkpipe(chip->dev, ep), (void *)urb->buffer, XDB4_PCM_IN_PACKET_SIZE, handler, urb);
+	if (usb_urb_ep_type_check(urb->instance)) {
 		dev_err(&chip->dev->dev, "%s: Sanity check failed!\n", __func__);
 		return -EINVAL;
 	}
@@ -863,15 +863,15 @@ static int xonedb4_pcm_init_bulk_in_urbs(struct pcm_urb *urb, struct xonedb4_chi
 static int xonedb4_pcm_init_int_in_urbs(struct pcm_urb *urb, struct xonedb4_chip *chip, unsigned int ep, void (*handler)(struct urb *))
 {
 	urb->chip = chip;
-	usb_init_urb(&urb->instance);
+	usb_init_urb(urb->instance);
 
 	urb->buffer = kzalloc(XDB4_PCM_IN_PACKET_SIZE, GFP_KERNEL);
 	if (!urb->buffer) {
 		return -ENOMEM;
 	}
 
-	usb_fill_int_urb(&urb->instance, chip->dev, usb_rcvintpipe(chip->dev, ep), (void *)urb->buffer, XDB4_PCM_IN_PACKET_SIZE, handler, urb, chip->dev->ep_in[PCM_IN_EP]->desc.bInterval);
-	if (usb_urb_ep_type_check(&urb->instance)) {
+	usb_fill_int_urb(urb->instance, chip->dev, usb_rcvintpipe(chip->dev, ep), (void *)urb->buffer, XDB4_PCM_IN_PACKET_SIZE, handler, urb, chip->dev->ep_in[PCM_IN_EP]->desc.bInterval);
+	if (usb_urb_ep_type_check(urb->instance)) {
 		dev_err(&chip->dev->dev, "%s: Sanity check failed!\n", __func__);
 		return -EINVAL;
 	}
@@ -879,6 +879,21 @@ static int xonedb4_pcm_init_int_in_urbs(struct pcm_urb *urb, struct xonedb4_chip
 	init_usb_anchor(&urb->submitted);
 
 	return 0;
+}
+
+static void xonedb4_free_urb(struct pcm_urb *urb)
+{
+	kfree(urb->buffer);
+	usb_free_urb(urb->instance);
+}
+
+static void xonedb4_pcm_free_urbs(struct pcm_runtime *rt)
+{
+	uint8_t i;
+	for (i = 0; i < PCM_N_URBS; i++) {
+		xonedb4_free_urb(&rt->pcm_in_urbs[i]);
+		xonedb4_free_urb(&rt->pcm_out_urbs[i]);
+	}
 }
 
 int xonedb4_pcm_init_urbs(struct xonedb4_chip *chip)
@@ -890,6 +905,10 @@ int xonedb4_pcm_init_urbs(struct xonedb4_chip *chip)
 	rt->chip = chip;
 
 	for (i = 0; i < PCM_N_URBS; i++) {
+		rt->pcm_in_urbs[i].instance = usb_alloc_urb(0, GFP_KERNEL);
+		if (rt->pcm_in_urbs[i].instance == NULL)
+			goto error;
+
 		if ((chip->dev->ep_in[PCM_IN_EP]->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK) {
 			ret = xonedb4_pcm_init_bulk_in_urbs(&rt->pcm_in_urbs[i], chip, PCM_IN_EP, xonedb4_pcm_in_urb_handler);
 		} else if ((chip->dev->ep_in[PCM_IN_EP]->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_INT) {
@@ -903,6 +922,9 @@ int xonedb4_pcm_init_urbs(struct xonedb4_chip *chip)
 	}
 
 	for (i = 0; i < PCM_N_URBS; i++) {
+		rt->pcm_out_urbs[i].instance = usb_alloc_urb(0, GFP_KERNEL);
+		if (rt->pcm_out_urbs[i].instance == NULL)
+			goto error;
 		if ((chip->dev->ep_out[PCM_OUT_EP]->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK) {
 			ret = xonedb4_pcm_init_bulk_out_urbs(&rt->pcm_out_urbs[i], chip, PCM_OUT_EP, xonedb4_pcm_bulk_out_urb_handler);
 		} else if ((chip->dev->ep_out[PCM_OUT_EP]->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_INT) {
@@ -917,33 +939,29 @@ int xonedb4_pcm_init_urbs(struct xonedb4_chip *chip)
 
 	mutex_lock(&rt->stream_mutex);
 	for (i = 0; i < PCM_N_URBS; i++) {
-		usb_anchor_urb(&rt->pcm_in_urbs[i].instance, &rt->pcm_in_urbs[i].submitted);
-		ret = usb_submit_urb(&rt->pcm_in_urbs[i].instance, GFP_ATOMIC);
-		if (ret < 0) {
-			xonedb4_pcm_stream_stop(rt);
-			xonedb4_pcm_kill_urbs(rt);
-			goto error;
-		}
+		usb_anchor_urb(rt->pcm_in_urbs[i].instance, &rt->pcm_in_urbs[i].submitted);
+		ret = usb_submit_urb(rt->pcm_in_urbs[i].instance, GFP_ATOMIC);
+		if (ret < 0)
+			goto err_submit;
 	}
 
 	for (i = 0; i < PCM_N_URBS; i++) {
-		usb_anchor_urb(&rt->pcm_out_urbs[i].instance, &rt->pcm_out_urbs[i].submitted);
-		ret = usb_submit_urb(&rt->pcm_out_urbs[i].instance, GFP_ATOMIC);
-		if (ret < 0) {
-			xonedb4_pcm_stream_stop(rt);
-			xonedb4_pcm_kill_urbs(rt);
-			goto error;
-		}
+		usb_anchor_urb(rt->pcm_out_urbs[i].instance, &rt->pcm_out_urbs[i].submitted);
+		ret = usb_submit_urb(rt->pcm_out_urbs[i].instance, GFP_ATOMIC);
+		if (ret < 0)
+			goto err_submit;
 	}
 	mutex_unlock(&rt->stream_mutex);
 	
 	return 0;
 
+err_submit:
+	xonedb4_pcm_stream_stop(rt);
+	xonedb4_pcm_kill_urbs(rt);
+	mutex_unlock(&rt->stream_mutex);
 error:
 	dev_err(&chip->dev->dev, "%s: ERROR\n", __func__);
-	mutex_unlock(&rt->stream_mutex);
-	for (i = 0; i < PCM_N_URBS; i++)
-		kfree(rt->pcm_out_urbs[i].buffer);
+	xonedb4_pcm_free_urbs(rt);
 	return ret;
 }
 
