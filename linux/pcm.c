@@ -73,14 +73,19 @@ static const int rates[] = {
 	44100,
 	48000,
 	88200,
-	96000
+	96000,
+	0,
 };
 static const int rates_alsaid[] = {
 	SNDRV_PCM_RATE_44100,
 	SNDRV_PCM_RATE_48000,
 	SNDRV_PCM_RATE_88200,
 	SNDRV_PCM_RATE_96000,
+	0,
 };
+
+#define XONEDB4_PCM_RATE_INVAL (ARRAY_SIZE(rates) - 1)
+#define XONEDB4_RATES_COUNT (XONEDB4_PCM_RATE_INVAL)
 
 static const struct snd_pcm_hardware pcm_hw = {
 	.info = SNDRV_PCM_INFO_MMAP |
@@ -604,7 +609,7 @@ static int xonedb4_pcm_open(struct snd_pcm_substream *alsa_sub)
 		sub = &rt->capture;
 	}
 
-	rt->rate = ARRAY_SIZE(rates);
+	rt->rate = XONEDB4_PCM_RATE_INVAL;
 	alsa_rt->hw.rates = rates_alsaid[rt->rate];
 
 	if (!sub) {
@@ -639,7 +644,7 @@ static int xonedb4_pcm_close(struct snd_pcm_substream *alsa_sub)
 		/* all substreams closed? if so, stop streaming */
 		if (!rt->playback.instance && !rt->capture.instance) {
 			xonedb4_pcm_stream_stop(rt);
-			rt->rate = ARRAY_SIZE(rates);
+			rt->rate = XONEDB4_PCM_RATE_INVAL;
 		}
 	}
 	mutex_unlock(&rt->stream_mutex);
@@ -668,10 +673,10 @@ static int xonedb4_pcm_prepare(struct snd_pcm_substream *alsa_sub)
 	sub->period_off = 0;
 
 	if (rt->stream_state == STREAM_DISABLED) {
-		for (rt->rate = 0; rt->rate < ARRAY_SIZE(rates); rt->rate++)
+		for (rt->rate = 0; rt->rate < XONEDB4_RATES_COUNT; rt->rate++)
 			if (alsa_rt->rate == rates[rt->rate])
 				break;
-		if (rt->rate == ARRAY_SIZE(rates)) {
+		if (rt->rate == XONEDB4_RATES_COUNT) {
 			mutex_unlock(&rt->stream_mutex);
 			dev_err(&rt->chip->dev->dev, "%s: Invalid samplerate %d\n", __func__, alsa_rt->rate);
 			return -EINVAL;
