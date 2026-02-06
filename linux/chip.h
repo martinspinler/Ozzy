@@ -8,6 +8,7 @@ struct pcm_runtime;
 
 struct xonedb4_drvdata {
 	int have_midi;
+	int n_playback_channels;
 	int isoc_out_packets;
 };
 

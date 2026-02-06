@@ -43,6 +43,7 @@ static struct xonedb4_drvdata drvdata_default = {
 
 static struct xonedb4_drvdata drvdata_alesis8 = {
 	.have_midi = 0,
+	.n_playback_channels = 2,
 	.isoc_out_packets = 40,
 };
 
