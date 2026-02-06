@@ -6,11 +6,15 @@
 #include "midi.h"
 #include "../legacy/common/ploytec.h"
 
+#define PCM_OUT_SYNC_EP					1
 #define PCM_OUT_EP						5
 #define PCM_OUT_ISOC_EP					2
 #define PCM_IN_EP						6
 
 #define PCM_N_URBS						4
+
+#define XDB4_PCM_SYNC_PKTS				5
+
 #define PCM_N_PLAYBACK_CHANNELS			8
 #define PCM_N_CAPTURE_CHANNELS			8
 
@@ -69,6 +73,7 @@ struct pcm_runtime {
 	bool panic; /* if set driver won't do anymore pcm on device */
 
 	struct pcm_urb pcm_out_urbs[PCM_N_URBS];
+	struct pcm_urb pcm_sync_urbs[PCM_N_URBS];
 	struct pcm_urb pcm_in_urbs[PCM_N_URBS];
 
 	struct mutex stream_mutex;
@@ -154,8 +159,13 @@ static void xonedb4_pcm_kill_urbs(struct pcm_runtime *rt)
 		if (!time) {
 			usb_kill_anchored_urbs(&rt->pcm_out_urbs[i].submitted);
 		}
+		time = usb_wait_anchor_empty_timeout(&rt->pcm_sync_urbs[i].submitted, 100);
+		if (!time) {
+			usb_kill_anchored_urbs(&rt->pcm_sync_urbs[i].submitted);
+		}
 		usb_kill_urb(rt->pcm_in_urbs[i].instance);
 		usb_kill_urb(rt->pcm_out_urbs[i].instance);
+		usb_kill_urb(rt->pcm_sync_urbs[i].instance);
 	}
 }
 
@@ -172,8 +182,13 @@ static void xonedb4_pcm_poison_urbs(struct pcm_runtime *rt)
 		if (!time) {
 			usb_kill_anchored_urbs(&rt->pcm_out_urbs[i].submitted);
 		}
+		time = usb_wait_anchor_empty_timeout(&rt->pcm_sync_urbs[i].submitted, 100);
+		if (!time) {
+			usb_kill_anchored_urbs(&rt->pcm_sync_urbs[i].submitted);
+		}
 		usb_poison_urb(rt->pcm_in_urbs[i].instance);
 		usb_poison_urb(rt->pcm_out_urbs[i].instance);
+		usb_poison_urb(rt->pcm_sync_urbs[i].instance);
 	}
 }
 
@@ -494,6 +509,33 @@ static void xonedb4_pcm_in_urb_handler(struct urb *usb_urb)
 
 in_fail:
 	dev_err(&in_urb->chip->dev->dev, "%s: IN FAIL\n", __func__);
+	rt->panic = true;
+}
+
+static void xonedb4_pcm_isoc_sync_urb_handler(struct urb *urb)
+{
+	struct pcm_urb *out_urb = urb->context;
+	struct pcm_runtime *rt = out_urb->chip->pcm;
+	int ret;
+
+	if (!rt || rt->panic || rt->stream_state == STREAM_STOPPING)
+		return;
+	if (unlikely(urb->status == -ENOENT || urb->status == -ENODEV || urb->status == -ECONNRESET || urb->status == -ESHUTDOWN)) {
+		/* Transient errors: stop resubmitting but do NOT set panic. */
+		return;
+	}
+
+	usb_anchor_urb(out_urb->instance, &out_urb->submitted);
+	ret = usb_submit_urb(out_urb->instance, GFP_ATOMIC);
+
+	if (ret < 0) {
+		usb_unanchor_urb(out_urb->instance);
+		goto out_fail;
+	}
+
+	return;
+
+out_fail:
 	rt->panic = true;
 }
 
@@ -846,6 +888,45 @@ static const struct snd_pcm_ops pcm_ops = {
 	.pointer = xonedb4_pcm_pointer,
 };
 
+static int xonedb4_pcm_init_sync_out_urbs(struct pcm_urb *urb, struct xonedb4_chip *chip, unsigned int ep, void (*handler)(struct urb *))
+{
+	int i;
+
+	usb_init_urb(urb->instance);
+
+	urb->len = 0x40 * XDB4_PCM_SYNC_PKTS;
+
+	urb->chip = chip;
+	urb->buffer = usb_alloc_coherent(chip->dev, urb->len, GFP_KERNEL, &urb->dma);
+	if (!urb->buffer) {
+		return -ENOMEM;
+	}
+
+	memset(urb->buffer, 0, urb->len);
+
+	for (i = 0; i < XDB4_PCM_SYNC_PKTS; i++) {
+		urb->instance->iso_frame_desc[i].offset = i * 0x40;
+		urb->instance->iso_frame_desc[i].length = 0x03;
+	}
+
+	urb->instance->number_of_packets = XDB4_PCM_SYNC_PKTS;
+	urb->instance->transfer_flags = 0;
+	urb->instance->transfer_flags |= URB_ISO_ASAP;
+	urb->instance->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+	urb->instance->interval = 8;
+	urb->instance->transfer_dma = urb->dma;
+
+	usb_fill_bulk_urb(urb->instance, chip->dev, usb_rcvisocpipe(chip->dev, ep), (void *)urb->buffer, urb->len, handler, urb);
+	if (usb_urb_ep_type_check(urb->instance)) {
+		dev_err(&chip->dev->dev, "%s: Sanity check failed!\n", __func__);
+		return -EINVAL;
+	}
+
+	init_usb_anchor(&urb->submitted);
+
+	return 0;
+}
+
 static int xonedb4_pcm_init_isoc_out_urbs(struct pcm_urb *urb, struct xonedb4_chip *chip, unsigned int ep, void (*handler)(struct urb *))
 {
 	size_t off;
@@ -1010,6 +1091,7 @@ static void xonedb4_pcm_free_urbs(struct pcm_runtime *rt)
 	for (i = 0; i < PCM_N_URBS; i++) {
 		xonedb4_free_urb(&rt->pcm_in_urbs[i]);
 		xonedb4_free_urb(&rt->pcm_out_urbs[i]);
+		xonedb4_free_urb(&rt->pcm_sync_urbs[i]);
 	}
 }
 
@@ -1042,9 +1124,14 @@ int xonedb4_pcm_init_urbs(struct xonedb4_chip *chip)
 		rt->pcm_out_urbs[i].instance = usb_alloc_urb(chip->cfg->isoc_out_packets, GFP_KERNEL);
 		if (rt->pcm_out_urbs[i].instance == NULL)
 			goto error;
+
+		rt->pcm_sync_urbs[i].instance = usb_alloc_urb(XDB4_PCM_SYNC_PKTS, GFP_KERNEL);
+		if (rt->pcm_sync_urbs[i].instance == NULL)
+			goto error;
 		if (chip->cfg->isoc_out_packets) {
 			rt->playback.isoc_acc = 0;
 			ret = xonedb4_pcm_init_isoc_out_urbs(&rt->pcm_out_urbs[i], chip, PCM_OUT_ISOC_EP, xonedb4_pcm_isoc_out_urb_handler);
+			ret = xonedb4_pcm_init_sync_out_urbs(&rt->pcm_sync_urbs[i], chip, PCM_OUT_SYNC_EP, xonedb4_pcm_isoc_sync_urb_handler);
 		} else if ((chip->dev->ep_out[PCM_OUT_EP]->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK) {
 			ret = xonedb4_pcm_init_bulk_out_urbs(&rt->pcm_out_urbs[i], chip, PCM_OUT_EP, xonedb4_pcm_bulk_out_urb_handler);
 		} else if ((chip->dev->ep_out[PCM_OUT_EP]->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_INT) {
@@ -1068,6 +1155,12 @@ int xonedb4_pcm_init_urbs(struct xonedb4_chip *chip)
 	for (i = 0; i < PCM_N_URBS; i++) {
 		usb_anchor_urb(rt->pcm_out_urbs[i].instance, &rt->pcm_out_urbs[i].submitted);
 		ret = usb_submit_urb(rt->pcm_out_urbs[i].instance, GFP_ATOMIC);
+		if (ret < 0)
+			goto err_submit;
+	}
+	for (i = 0; i < PCM_N_URBS; i++) {
+		usb_anchor_urb(rt->pcm_sync_urbs[i].instance, &rt->pcm_sync_urbs[i].submitted);
+		ret = usb_submit_urb(rt->pcm_sync_urbs[i].instance, GFP_ATOMIC);
 		if (ret < 0)
 			goto err_submit;
 	}
