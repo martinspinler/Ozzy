@@ -7,6 +7,7 @@
 #include "../legacy/common/ploytec.h"
 
 #define PCM_OUT_EP						5
+#define PCM_OUT_ISOC_EP					2
 #define PCM_IN_EP						6
 
 #define PCM_N_URBS						4
@@ -29,11 +30,15 @@
 #define ALSA_MIN_BUFSIZE				2 * ALSA_PCM_OUT_PACKET_SIZE
 #define ALSA_MAX_BUFSIZE				2000 * ALSA_PCM_OUT_PACKET_SIZE
 
+static const uint32_t UPPS = 8000;      /* USB Packets per second (125uS = USB 2.0 uframe) */
+
 struct pcm_urb {
 	struct xonedb4_chip *chip;
 	struct urb *instance;
 	struct usb_anchor submitted;
 	uint8_t *buffer;
+	size_t len;     /* nonzero only when usb_alloc_coherent is used */
+	dma_addr_t dma;
 };
 
 struct pcm_substream {
@@ -44,6 +49,8 @@ struct pcm_substream {
 
 	snd_pcm_uframes_t dma_off; /* current position in alsa dma_area */
 	snd_pcm_uframes_t period_off; /* current position in current period */
+
+	size_t isoc_acc;        /* accumulator for current frame rate */
 };
 
 enum { /* pcm streaming states */
@@ -490,6 +497,75 @@ in_fail:
 	rt->panic = true;
 }
 
+static ssize_t distribute_isoc(struct pcm_urb *out_urb)
+{
+	struct urb *urb = out_urb->instance;
+	struct pcm_runtime *rt = out_urb->chip->pcm;
+	struct pcm_substream *sub = &rt->playback;
+
+	int i;
+	const uint32_t FR = rates[out_urb->chip->devicerate];   /* Frame rate */
+	const uint32_t frame_threshold = UPPS;
+
+	uint32_t current_frame_rate = FR;               /* Ajdusted frame rate */
+	size_t acc = sub->isoc_acc;	                /* Accumlated remainder over URBs */
+	ssize_t off = 0;
+	size_t p_frames;                                /* Frames per packet */
+	size_t len;                                     /* one USB packet length in bytes */
+	for (i = 0; i < urb->number_of_packets; i++) {
+		p_frames = 0;
+		acc += current_frame_rate;
+		while (acc >= frame_threshold) {
+			p_frames++;
+			acc -= frame_threshold;
+		}
+
+		len = p_frames * 6;
+		urb->iso_frame_desc[i].offset = off;
+		urb->iso_frame_desc[i].length = len;
+		off += len;
+	}
+	return off;
+}
+
+static void xonedb4_pcm_isoc_out_urb_handler(struct urb *usb_urb)
+{
+	struct pcm_urb *out_urb = usb_urb->context;
+	struct pcm_runtime *rt = out_urb->chip->pcm;
+	struct pcm_substream *sub;
+	unsigned long flags;
+
+	int ret;
+	size_t off;
+	if (!rt || rt->panic || rt->stream_state == STREAM_STOPPING)
+		return;
+
+	sub = &rt->playback;
+	if (unlikely(usb_urb->status == -ENOENT || usb_urb->status == -ENODEV || usb_urb->status == -ECONNRESET || usb_urb->status == -ESHUTDOWN)) {
+		/* Transient errors: stop resubmitting but do NOT set panic. */
+		return;
+	}
+
+	spin_lock_irqsave(&sub->lock, flags);
+
+	off = distribute_isoc(out_urb);
+
+	spin_unlock_irqrestore(&sub->lock, flags);
+
+	usb_anchor_urb(usb_urb, &out_urb->submitted);
+	ret = usb_submit_urb(usb_urb, GFP_ATOMIC);
+
+	if (ret < 0) {
+		usb_unanchor_urb(usb_urb);
+		goto out_fail;
+	}
+
+	return;
+
+out_fail:
+	rt->panic = true;
+}
+
 static void xonedb4_pcm_bulk_out_urb_handler(struct urb *usb_urb)
 {
 	struct pcm_urb *out_urb = usb_urb->context;
@@ -770,6 +846,44 @@ static const struct snd_pcm_ops pcm_ops = {
 	.pointer = xonedb4_pcm_pointer,
 };
 
+static int xonedb4_pcm_init_isoc_out_urbs(struct pcm_urb *urb, struct xonedb4_chip *chip, unsigned int ep, void (*handler)(struct urb *))
+{
+	size_t off;
+
+	usb_init_urb(urb->instance);
+
+	urb->len = ALSA_BYTES_PER_SAMPLE * chip->cfg->isoc_out_packets *
+			chip->cfg->n_playback_channels *
+			(rates[XONEDB4_PCM_RATE_INVAL-1] / UPPS);
+
+	urb->chip = chip;
+	urb->buffer = usb_alloc_coherent(chip->dev, urb->len, GFP_KERNEL, &urb->dma);
+	if (!urb->buffer) {
+		return -ENOMEM;
+	}
+
+	memset(urb->buffer, 0, urb->len);
+
+	urb->instance->number_of_packets = chip->cfg->isoc_out_packets;
+	urb->instance->interval = 1;
+	urb->instance->transfer_flags = 0;
+	urb->instance->transfer_flags |= URB_ISO_ASAP;
+	urb->instance->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+	urb->instance->transfer_dma = urb->dma;
+
+	off = distribute_isoc(urb);
+
+	usb_fill_bulk_urb(urb->instance, chip->dev, usb_sndisocpipe(chip->dev, ep), (void *)urb->buffer, off, handler, urb);
+	if (usb_urb_ep_type_check(urb->instance)) {
+		dev_err(&chip->dev->dev, "%s: Sanity check failed!\n", __func__);
+		return -EINVAL;
+	}
+
+	init_usb_anchor(&urb->submitted);
+
+	return 0;
+}
+
 static int xonedb4_pcm_init_bulk_out_urbs(struct pcm_urb *urb, struct xonedb4_chip *chip, unsigned int ep, void (*handler)(struct urb *))
 {
 	urb->chip = chip;
@@ -883,7 +997,10 @@ static int xonedb4_pcm_init_int_in_urbs(struct pcm_urb *urb, struct xonedb4_chip
 
 static void xonedb4_free_urb(struct pcm_urb *urb)
 {
-	kfree(urb->buffer);
+	if (urb->len)
+		usb_free_coherent(urb->chip->dev, urb->len, urb->buffer, urb->dma);
+	else
+		kfree(urb->buffer);
 	usb_free_urb(urb->instance);
 }
 
@@ -922,10 +1039,13 @@ int xonedb4_pcm_init_urbs(struct xonedb4_chip *chip)
 	}
 
 	for (i = 0; i < PCM_N_URBS; i++) {
-		rt->pcm_out_urbs[i].instance = usb_alloc_urb(0, GFP_KERNEL);
+		rt->pcm_out_urbs[i].instance = usb_alloc_urb(chip->cfg->isoc_out_packets, GFP_KERNEL);
 		if (rt->pcm_out_urbs[i].instance == NULL)
 			goto error;
-		if ((chip->dev->ep_out[PCM_OUT_EP]->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK) {
+		if (chip->cfg->isoc_out_packets) {
+			rt->playback.isoc_acc = 0;
+			ret = xonedb4_pcm_init_isoc_out_urbs(&rt->pcm_out_urbs[i], chip, PCM_OUT_ISOC_EP, xonedb4_pcm_isoc_out_urb_handler);
+		} else if ((chip->dev->ep_out[PCM_OUT_EP]->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK) {
 			ret = xonedb4_pcm_init_bulk_out_urbs(&rt->pcm_out_urbs[i], chip, PCM_OUT_EP, xonedb4_pcm_bulk_out_urb_handler);
 		} else if ((chip->dev->ep_out[PCM_OUT_EP]->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_INT) {
 			ret = xonedb4_pcm_init_int_out_urbs(&rt->pcm_out_urbs[i], chip, PCM_OUT_EP, xonedb4_pcm_int_out_urb_handler);
