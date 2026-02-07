@@ -276,6 +276,35 @@ static bool xonedb4_pcm_capture(struct pcm_substream *sub, struct pcm_urb *urb)
 	return false;
 }
 
+static bool xonedb4_pcm_isoc_playback(struct pcm_substream *sub, struct pcm_urb *urb, size_t usb_len)
+{
+	struct snd_pcm_runtime *alsa_rt = sub->instance->runtime;
+	uint32_t pcm_buffer_size = snd_pcm_lib_buffer_bytes(sub->instance);
+
+	if (sub->dma_off + usb_len <= pcm_buffer_size) {
+		memcpy(urb->buffer, alsa_rt->dma_area + sub->dma_off, usb_len);
+	} else {
+		/* wrap around at end of ring buffer */
+		size_t len1, len2;
+		len1 = pcm_buffer_size - sub->dma_off;
+		len2 = usb_len - len2;
+		memcpy(urb->buffer, alsa_rt->dma_area + sub->dma_off, len1);
+		memcpy(urb->buffer + len1, alsa_rt->dma_area, len2);
+	}
+	sub->dma_off += usb_len;
+	if (sub->dma_off >= pcm_buffer_size) {
+		sub->dma_off -= pcm_buffer_size;
+	}
+
+	sub->period_off += usb_len;
+	if (sub->period_off >= alsa_rt->period_size) {
+		sub->period_off %= alsa_rt->period_size;
+		return true;
+	}
+
+	return false;
+}
+
 /* call with substream locked */
 /* returns true if a period elapsed */
 static bool xonedb4_pcm_bulk_playback(struct pcm_substream *sub, struct pcm_urb *urb)
@@ -575,6 +604,7 @@ static void xonedb4_pcm_isoc_out_urb_handler(struct urb *usb_urb)
 	struct pcm_urb *out_urb = usb_urb->context;
 	struct pcm_runtime *rt = out_urb->chip->pcm;
 	struct pcm_substream *sub;
+	bool do_period_elapsed = false;
 	unsigned long flags;
 
 	int ret;
@@ -592,7 +622,16 @@ static void xonedb4_pcm_isoc_out_urb_handler(struct urb *usb_urb)
 
 	off = distribute_isoc(out_urb);
 
+	if (sub->active) {
+		do_period_elapsed = xonedb4_pcm_isoc_playback(sub, out_urb, off);
+	} else {
+		memset(out_urb->buffer, 0, off);
+	}
 	spin_unlock_irqrestore(&sub->lock, flags);
+
+	if (do_period_elapsed) {
+		snd_pcm_period_elapsed(sub->instance);
+	}
 
 	usb_anchor_urb(usb_urb, &out_urb->submitted);
 	ret = usb_submit_urb(usb_urb, GFP_ATOMIC);
@@ -707,6 +746,39 @@ static void xonedb4_pcm_int_out_urb_handler(struct urb *usb_urb)
 out_fail:
 	dev_err(&out_urb->chip->dev->dev, "%s: OUT FAIL\n", __func__);
 	rt->panic = true;
+}
+
+static int xonedb4_pcm_open_out(struct snd_pcm_substream *alsa_sub)
+{
+	struct pcm_runtime *rt = snd_pcm_substream_chip(alsa_sub);
+	struct pcm_substream *sub = &rt->playback;
+	struct snd_pcm_runtime *alsa_rt = alsa_sub->runtime;
+
+	if (rt->panic)
+		return -EPIPE;
+
+	mutex_lock(&rt->stream_mutex);
+	alsa_rt->hw = pcm_hw;
+	alsa_rt->hw.channels_min = rt->chip->cfg->n_playback_channels;
+	alsa_rt->hw.channels_max = rt->chip->cfg->n_playback_channels;
+
+	alsa_rt->hw.period_bytes_min = 2 * rt->pcm_out_urbs[0].len;
+	alsa_rt->hw.period_bytes_max = 256 * rt->pcm_out_urbs[0].len;
+	alsa_rt->hw.buffer_bytes_max = 256 * rt->pcm_out_urbs[0].len;
+
+	rt->rate = XONEDB4_PCM_RATE_INVAL;
+	alsa_rt->hw.rates = rates_alsaid[rt->rate];
+
+	if (!sub) {
+		mutex_unlock(&rt->stream_mutex);
+		dev_err(&rt->chip->dev->dev, "%s: Invalid stream type\n", __func__);
+		return -EINVAL;
+	}
+
+	sub->instance = alsa_sub;
+	sub->active = false;
+	mutex_unlock(&rt->stream_mutex);
+	return 0;
 }
 
 static int xonedb4_pcm_open(struct snd_pcm_substream *alsa_sub)
@@ -882,6 +954,14 @@ void xonedb4_pcm_abort(struct xonedb4_chip *chip)
 
 static const struct snd_pcm_ops pcm_ops = {
 	.open = xonedb4_pcm_open,
+	.close = xonedb4_pcm_close,
+	.prepare = xonedb4_pcm_prepare,
+	.trigger = xonedb4_pcm_trigger,
+	.pointer = xonedb4_pcm_pointer,
+};
+
+static const struct snd_pcm_ops pcm_ops_out = {
+	.open = xonedb4_pcm_open_out,
 	.close = xonedb4_pcm_close,
 	.prepare = xonedb4_pcm_prepare,
 	.trigger = xonedb4_pcm_trigger,
@@ -1205,7 +1285,10 @@ int xonedb4_pcm_init(struct xonedb4_chip *chip)
 	pcm->private_data = rt;
 
 	strscpy(pcm->name, chip->dev->product, sizeof(pcm->name));
-	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &pcm_ops);
+	if (chip->cfg->isoc_out_packets)
+		snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &pcm_ops_out);
+	else
+		snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &pcm_ops);
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &pcm_ops);
 	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
 
