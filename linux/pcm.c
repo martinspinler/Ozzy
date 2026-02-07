@@ -11,7 +11,7 @@
 #define PCM_OUT_ISOC_EP					2
 #define PCM_IN_EP						6
 
-#define PCM_N_URBS						4
+#define PCM_N_URBS						3
 
 #define XDB4_PCM_SYNC_PKTS				5
 
@@ -54,7 +54,8 @@ struct pcm_substream {
 	snd_pcm_uframes_t dma_off; /* current position in alsa dma_area */
 	snd_pcm_uframes_t period_off; /* current position in current period */
 
-	size_t isoc_acc;        /* accumulator for current frame rate */
+	size_t isoc_acc;        /* accumulator for frame rate distribution */
+	uint32_t isoc_rate;     /* smoothed frame rate from sync feedback (Hz) */
 };
 
 enum { /* pcm streaming states */
@@ -75,6 +76,10 @@ struct pcm_runtime {
 	struct pcm_urb pcm_out_urbs[PCM_N_URBS];
 	struct pcm_urb pcm_sync_urbs[PCM_N_URBS];
 	struct pcm_urb pcm_in_urbs[PCM_N_URBS];
+
+	uint16_t sync_frames[256 * 256];  /* ring buffer: frames/ms from sync EP */
+	uint16_t sync_rd;                 /* read index into sync_frames */
+	uint16_t sync_wr;                 /* write index into sync_frames */
 
 	struct mutex stream_mutex;
 	uint8_t stream_state; /* one of STREAM_XXX */
@@ -162,13 +167,15 @@ static void xonedb4_pcm_kill_urbs(struct pcm_runtime *rt)
 		if (!time) {
 			usb_kill_anchored_urbs(&rt->pcm_out_urbs[i].submitted);
 		}
-		time = usb_wait_anchor_empty_timeout(&rt->pcm_sync_urbs[i].submitted, 100);
-		if (!time) {
-			usb_kill_anchored_urbs(&rt->pcm_sync_urbs[i].submitted);
+		if (rt->pcm_sync_urbs[i].instance) {
+			time = usb_wait_anchor_empty_timeout(&rt->pcm_sync_urbs[i].submitted, 100);
+			if (!time) {
+				usb_kill_anchored_urbs(&rt->pcm_sync_urbs[i].submitted);
+			}
+			usb_kill_urb(rt->pcm_sync_urbs[i].instance);
 		}
 		usb_kill_urb(rt->pcm_in_urbs[i].instance);
 		usb_kill_urb(rt->pcm_out_urbs[i].instance);
-		usb_kill_urb(rt->pcm_sync_urbs[i].instance);
 	}
 }
 
@@ -185,13 +192,15 @@ static void xonedb4_pcm_poison_urbs(struct pcm_runtime *rt)
 		if (!time) {
 			usb_kill_anchored_urbs(&rt->pcm_out_urbs[i].submitted);
 		}
-		time = usb_wait_anchor_empty_timeout(&rt->pcm_sync_urbs[i].submitted, 100);
-		if (!time) {
-			usb_kill_anchored_urbs(&rt->pcm_sync_urbs[i].submitted);
+		if (rt->pcm_sync_urbs[i].instance) {
+			time = usb_wait_anchor_empty_timeout(&rt->pcm_sync_urbs[i].submitted, 100);
+			if (!time) {
+				usb_kill_anchored_urbs(&rt->pcm_sync_urbs[i].submitted);
+			}
+			usb_poison_urb(rt->pcm_sync_urbs[i].instance);
 		}
 		usb_poison_urb(rt->pcm_in_urbs[i].instance);
 		usb_poison_urb(rt->pcm_out_urbs[i].instance);
-		usb_poison_urb(rt->pcm_sync_urbs[i].instance);
 	}
 }
 
@@ -290,7 +299,7 @@ static bool xonedb4_pcm_isoc_playback(struct pcm_substream *sub, struct pcm_urb 
 		/* wrap around at end of ring buffer */
 		size_t len1, len2;
 		len1 = pcm_buffer_size - sub->dma_off;
-		len2 = usb_len - len2;
+		len2 = usb_len - len1;
 		memcpy(urb->buffer, alsa_rt->dma_area + sub->dma_off, len1);
 		memcpy(urb->buffer + len1, alsa_rt->dma_area, len2);
 	}
@@ -549,12 +558,22 @@ static void xonedb4_pcm_isoc_sync_urb_handler(struct urb *urb)
 	struct pcm_urb *out_urb = urb->context;
 	struct pcm_runtime *rt = out_urb->chip->pcm;
 	int ret;
+	int i;
 
 	if (!rt || rt->panic || rt->stream_state == STREAM_STOPPING)
 		return;
 	if (unlikely(urb->status == -ENOENT || urb->status == -ENODEV || urb->status == -ECONNRESET || urb->status == -ESHUTDOWN)) {
 		/* Transient errors: stop resubmitting but do NOT set panic. */
 		return;
+	}
+
+	for (i = 0; i < XDB4_PCM_SYNC_PKTS; i++) {
+		if (urb->iso_frame_desc[i].actual_length != 3) {
+			rt->sync_frames[rt->sync_wr] = 255;
+		} else {
+			rt->sync_frames[rt->sync_wr] = out_urb->buffer[i*0x40 + 0];
+		}
+		rt->sync_wr++;
 	}
 
 	usb_anchor_urb(out_urb->instance, &out_urb->submitted);
@@ -578,27 +597,60 @@ static ssize_t distribute_isoc(struct pcm_urb *out_urb)
 	struct pcm_substream *sub = &rt->playback;
 
 	int i;
-	const uint32_t FR = rates[out_urb->chip->devicerate];   /* Frame rate */
-	const uint32_t frame_threshold = UPPS;
+	const uint32_t FR = rates[out_urb->chip->devicerate];   /* Nominal frame rate */
+	const uint32_t FRAME_THRESHOLD = UPPS;                  /* 8000 */
 
-	uint32_t current_frame_rate = FR;               /* Ajdusted frame rate */
-	size_t acc = sub->isoc_acc;	                /* Accumlated remainder over URBs */
-	ssize_t off = 0;
-	size_t p_frames;                                /* Frames per packet */
-	size_t len;                                     /* one USB packet length in bytes */
-	for (i = 0; i < urb->number_of_packets; i++) {
-		p_frames = 0;
-		acc += current_frame_rate;
-		while (acc >= frame_threshold) {
-			p_frames++;
-			acc -= frame_threshold;
+	uint32_t current_frame_rate = sub->isoc_rate;            /* Smoothed rate from sync */
+	size_t acc = sub->isoc_acc;                              /* Accumulator remainder */
+	size_t off = 0;
+	size_t p_frames;
+	size_t len;
+
+	/* --- Sync feedback: consume all pending sync entries --- */
+	uint16_t sync_cnt = rt->sync_wr - rt->sync_rd;
+
+	if (sync_cnt > 0) {
+		size_t sfcs = 0;
+		size_t valid = 0;
+		const uint8_t fpms_min = FR / 1000 - 5;
+		const uint8_t fpms_max = FR / 1000 + 5;
+
+		while (rt->sync_rd != rt->sync_wr) {
+			uint16_t sfc = rt->sync_frames[rt->sync_rd];
+			rt->sync_rd++;
+
+			if (sfc != 255 && sfc >= fpms_min && sfc <= fpms_max) {
+				sfcs += sfc;
+				valid++;
+			}
 		}
+
+		if (valid > 0) {
+			/* Average frames/ms → Hz, then IIR-filter into running rate.
+			 * The 1/8 blend factor smooths quantization noise
+			 * (±1 frame/ms ≈ ±1000 Hz jitter) while tracking
+			 * real clock drift (ppm-level, very slow). */
+			uint32_t measured = (uint32_t)(sfcs * 1000 / valid);
+			current_frame_rate = (current_frame_rate * 7 + measured) / 8;
+		}
+
+		sub->isoc_rate = current_frame_rate;
+	}
+
+	/* --- Distribute frames across USB packets via accumulator --- */
+	for (i = 0; i < urb->number_of_packets; i++) {
+		acc += current_frame_rate;
+		p_frames = acc / FRAME_THRESHOLD;
+		acc -= p_frames * FRAME_THRESHOLD;
 
 		len = p_frames * 6;
 		urb->iso_frame_desc[i].offset = off;
 		urb->iso_frame_desc[i].length = len;
 		off += len;
 	}
+
+	sub->isoc_acc = acc;
+
 	return off;
 }
 
@@ -1161,6 +1213,8 @@ static int xonedb4_pcm_init_int_in_urbs(struct pcm_urb *urb, struct xonedb4_chip
 
 static void xonedb4_free_urb(struct pcm_urb *urb)
 {
+	if (!urb->instance)
+		return;
 	if (urb->len)
 		usb_free_coherent(urb->chip->dev, urb->len, urb->buffer, urb->dma);
 	else
@@ -1208,12 +1262,16 @@ int xonedb4_pcm_init_urbs(struct xonedb4_chip *chip)
 		if (rt->pcm_out_urbs[i].instance == NULL)
 			goto error;
 
-		rt->pcm_sync_urbs[i].instance = usb_alloc_urb(XDB4_PCM_SYNC_PKTS, GFP_KERNEL);
-		if (rt->pcm_sync_urbs[i].instance == NULL)
-			goto error;
 		if (chip->cfg->isoc_out_packets) {
+			rt->pcm_sync_urbs[i].instance = usb_alloc_urb(XDB4_PCM_SYNC_PKTS, GFP_KERNEL);
+			if (rt->pcm_sync_urbs[i].instance == NULL)
+				goto error;
+
 			rt->playback.isoc_acc = 0;
+			rt->playback.isoc_rate = rates[chip->devicerate];
 			ret = xonedb4_pcm_init_isoc_out_urbs(&rt->pcm_out_urbs[i], chip, PCM_OUT_ISOC_EP, xonedb4_pcm_isoc_out_urb_handler);
+			if (ret < 0)
+				goto error;
 			ret = xonedb4_pcm_init_sync_out_urbs(&rt->pcm_sync_urbs[i], chip, PCM_OUT_SYNC_EP, xonedb4_pcm_isoc_sync_urb_handler);
 		} else if ((chip->dev->ep_out[PCM_OUT_EP]->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK) {
 			ret = xonedb4_pcm_init_bulk_out_urbs(&rt->pcm_out_urbs[i], chip, PCM_OUT_EP, xonedb4_pcm_bulk_out_urb_handler);
@@ -1242,10 +1300,12 @@ int xonedb4_pcm_init_urbs(struct xonedb4_chip *chip)
 			goto err_submit;
 	}
 	for (i = 0; i < PCM_N_URBS; i++) {
-		usb_anchor_urb(rt->pcm_sync_urbs[i].instance, &rt->pcm_sync_urbs[i].submitted);
-		ret = usb_submit_urb(rt->pcm_sync_urbs[i].instance, GFP_ATOMIC);
-		if (ret < 0)
-			goto err_submit;
+		if (rt->pcm_sync_urbs[i].instance) {
+			usb_anchor_urb(rt->pcm_sync_urbs[i].instance, &rt->pcm_sync_urbs[i].submitted);
+			ret = usb_submit_urb(rt->pcm_sync_urbs[i].instance, GFP_ATOMIC);
+			if (ret < 0)
+				goto err_submit;
+		}
 	}
 	mutex_unlock(&rt->stream_mutex);
 	
