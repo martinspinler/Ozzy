@@ -142,7 +142,8 @@ static void xonedb4_pcm_stream_stop(struct pcm_runtime *rt)
 {
 	if (rt->stream_state != STREAM_DISABLED) {
 		rt->stream_state = STREAM_STOPPING;
-		rt->stream_state = STREAM_DISABLED;
+			xonedb4_pcm_kill_urbs(rt);
+			rt->stream_state = STREAM_DISABLED;
 	}
 }
 
