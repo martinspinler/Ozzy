@@ -1275,6 +1275,7 @@ int xonedb4_pcm_init(struct xonedb4_chip *chip)
 
 	mutex_init(&rt->stream_mutex);
 	spin_lock_init(&rt->playback.lock);
+	spin_lock_init(&rt->capture.lock);
 
 	ret = snd_pcm_new(chip->card, chip->dev->product, 0, 1, 1, &pcm);
 	if (ret < 0) {
