@@ -188,6 +188,13 @@ int xonedb4_get_samplerate(struct xonedb4_chip *chip)
 	return ret;
 }
 
+/* Called by ALSA when the sound card is freed */
+static void xonedb4_card_private_free(struct snd_card *card)
+{
+	struct xonedb4_chip *chip = card->private_data;
+	xonedb4_pcm_destroy(chip);
+}
+
 /* In case of the Xone DB4, this actually gets called twice as the device announced 2 interfaces */
 static int xonedb4_probe(struct usb_interface *intf, const struct usb_device_id *usb_id)
 {
@@ -304,6 +311,7 @@ static int xonedb4_probe(struct usb_interface *intf, const struct usb_device_id 
 
 	chip = card->private_data;
 	chip->card = card;
+	card->private_free = xonedb4_card_private_free;
 	chip->dev = device;
 	if (usb_id->driver_info)
 		chip->cfg = (struct xonedb4_drvdata *)usb_id->driver_info;

@@ -138,6 +138,8 @@ static struct pcm_substream *xonedb4_pcm_get_substream(struct snd_pcm_substream 
 	return NULL;
 }
 
+static void xonedb4_pcm_kill_urbs(struct pcm_runtime *rt);
+
 static void xonedb4_pcm_stream_stop(struct pcm_runtime *rt)
 {
 	if (rt->stream_state != STREAM_DISABLED) {
@@ -1307,6 +1309,34 @@ int xonedb4_pcm_init(struct xonedb4_chip *chip)
 
 error:
 	dev_err(&chip->dev->dev, "%s: ERROR\n", __func__);
+	chip->pcm = NULL;
 	kfree(rt);
 	return ret;
+}
+
+void xonedb4_pcm_destroy(struct xonedb4_chip *chip)
+{
+	struct pcm_runtime *rt = chip->pcm;
+
+	if (!rt)
+		return;
+
+	/* Make sure URBs are dead before freeing their resources */
+	rt->panic = true;
+
+	/* Always kill URBs synchronously regardless of stream_state.
+	 * URBs are submitted in xonedb4_pcm_init_urbs() independently of
+	 * stream_state, so they may be active even when stream_state is
+	 * STREAM_DISABLED. Using usb_kill_urb (synchronous) ensures all
+	 * completion handlers have finished before we free the URB memory.
+	 */
+	if (rt->stream_state != STREAM_DISABLED) {
+		rt->stream_state = STREAM_STOPPING;
+	}
+	xonedb4_pcm_kill_urbs(rt);
+	rt->stream_state = STREAM_DISABLED;
+
+	xonedb4_pcm_free_urbs(rt);
+	chip->pcm = NULL;
+	kfree(rt);
 }
