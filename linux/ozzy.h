@@ -42,6 +42,19 @@ struct ozzy_device_info {
 	u64 alsa_format;                  /* SNDRV_PCM_FMTBIT_xxx */
 	unsigned int bytes_per_sample;    /* bytes per ALSA sample (e.g. 3 for S24_3LE) */
 
+	/*
+	 * Isochronous output (optional). When isoc_out_packets is nonzero,
+	 * the core uses variable-length isochronous URBs for playback
+	 * instead of the fixed-size bulk/interrupt out_ep path, with an
+	 * accumulator that distributes ALSA frames across USB packets
+	 * according to the current sample rate. If isoc_sync_ep is also
+	 * set, feedback packets from that endpoint are averaged into the
+	 * accumulator's effective rate to track real clock drift.
+	 */
+	unsigned int isoc_out_ep;         /* isochronous output endpoint (0 = not isoc) */
+	unsigned int isoc_sync_ep;        /* isochronous feedback endpoint (0 = none) */
+	unsigned int isoc_out_packets;    /* USB packets per isoc output URB */
+
 	/* MIDI topology */
 	unsigned int midi_in_ep;          /* dedicated MIDI input endpoint (0 = none) */
 	bool midi_out_embedded;           /* true if MIDI out is embedded in PCM out packets */

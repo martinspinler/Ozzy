@@ -85,6 +85,19 @@ static void ozzy_pcm_kill_urbs(struct pcm_runtime *rt)
 			usb_kill_anchored_urbs(&rt->pcm_out_urbs[i].submitted);
 		usb_kill_urb(&rt->pcm_in_urbs[i].instance);
 		usb_kill_urb(&rt->pcm_out_urbs[i].instance);
+
+		if (rt->pcm_isoc_out_urbs[i].instance) {
+			time = usb_wait_anchor_empty_timeout(&rt->pcm_isoc_out_urbs[i].submitted, 100);
+			if (!time)
+				usb_kill_anchored_urbs(&rt->pcm_isoc_out_urbs[i].submitted);
+			usb_kill_urb(rt->pcm_isoc_out_urbs[i].instance);
+		}
+		if (rt->pcm_isoc_sync_urbs[i].instance) {
+			time = usb_wait_anchor_empty_timeout(&rt->pcm_isoc_sync_urbs[i].submitted, 100);
+			if (!time)
+				usb_kill_anchored_urbs(&rt->pcm_isoc_sync_urbs[i].submitted);
+			usb_kill_urb(rt->pcm_isoc_sync_urbs[i].instance);
+		}
 	}
 }
 
@@ -231,6 +244,219 @@ static void ozzy_pcm_out_urb_handler(struct urb *usb_urb)
 
 out_fail:
 	ozzy_pcm_err(&chip->dev->dev, "PCM output URB failure\n");
+	rt->panic = true;
+}
+
+/* ========================================================================
+ * Isochronous Output + Sync Feedback
+ *
+ * Used instead of the fixed-size bulk/interrupt out path when
+ * chip->info->isoc_out_packets is nonzero. Isochronous transfers have
+ * no flow control, so the number of audio frames per USB packet must
+ * be computed per-URB from an accumulator driven by the device's
+ * current sample rate. If the device also exposes a sync (feedback)
+ * endpoint, its packets report the actual USB-frame rate the device is
+ * consuming at, which is averaged in to correct for clock drift.
+ * ======================================================================== */
+
+static const uint32_t OZZY_ISOC_UPPS = 8000; /* USB packets/sec (125us = USB 2.0 uframe) */
+
+/*
+ * ozzy_pcm_distribute_isoc - Fill in iso_frame_desc[] lengths for one URB.
+ *
+ * Call with the playback substream lock held. Consumes any pending
+ * sync feedback samples, folds them into a smoothed rate estimate via
+ * a simple IIR filter, then distributes ALSA frames across the URB's
+ * USB packets according to that rate. Returns the total number of
+ * ALSA bytes needed to fill this URB.
+ */
+static size_t ozzy_pcm_distribute_isoc(struct ozzy_chip *chip, struct pcm_isoc_urb *out_urb)
+{
+	struct pcm_runtime *rt = chip->pcm;
+	struct urb *urb = out_urb->instance;
+	struct pcm_substream *sub = &rt->playback;
+	const struct ozzy_device_info *info = chip->info;
+	unsigned int alsa_frame_bytes = info->playback_channels * info->bytes_per_sample;
+
+	const uint32_t nominal_rate = info->rates[chip->current_rate];
+	uint32_t current_frame_rate = sub->isoc_rate ? sub->isoc_rate : nominal_rate;
+	size_t acc = sub->isoc_acc;
+	size_t off = 0;
+	int i;
+
+	uint16_t sync_cnt = rt->sync_wr - rt->sync_rd;
+
+	if (sync_cnt > 0) {
+		size_t sfcs = 0;
+		size_t valid = 0;
+		const uint8_t fpms_min = nominal_rate / 1000 - 5;
+		const uint8_t fpms_max = nominal_rate / 1000 + 5;
+
+		while (rt->sync_rd != rt->sync_wr) {
+			uint16_t sfc = rt->sync_frames[rt->sync_rd];
+
+			rt->sync_rd++;
+			if (sfc != 255 && sfc >= fpms_min && sfc <= fpms_max) {
+				sfcs += sfc;
+				valid++;
+			}
+		}
+
+		if (valid > 0) {
+			/* Average frames/ms -> Hz, then IIR-filter into the running
+			 * rate. The 1/8 blend factor smooths quantization noise
+			 * while still tracking real (ppm-level) clock drift. */
+			uint32_t measured = (uint32_t)(sfcs * 1000 / valid);
+
+			current_frame_rate = (current_frame_rate * 7 + measured) / 8;
+		}
+
+		sub->isoc_rate = current_frame_rate;
+	}
+
+	for (i = 0; i < urb->number_of_packets; i++) {
+		size_t p_frames;
+		size_t len;
+
+		acc += current_frame_rate;
+		p_frames = acc / OZZY_ISOC_UPPS;
+		acc -= p_frames * OZZY_ISOC_UPPS;
+
+		len = p_frames * alsa_frame_bytes;
+		urb->iso_frame_desc[i].offset = off;
+		urb->iso_frame_desc[i].length = len;
+		off += len;
+	}
+
+	sub->isoc_acc = acc;
+
+	return off;
+}
+
+/*
+ * ozzy_pcm_isoc_sync_urb_handler - Isochronous sync (feedback) URB handler.
+ * Records the frames/ms value from each feedback packet into the sync
+ * ring buffer for ozzy_pcm_distribute_isoc() to consume, then resubmits.
+ */
+static void ozzy_pcm_isoc_sync_urb_handler(struct urb *usb_urb)
+{
+	struct pcm_isoc_urb *sync_urb = usb_urb->context;
+	struct ozzy_chip *chip = sync_urb->chip;
+	struct pcm_runtime *rt = chip->pcm;
+	int i, ret;
+
+	if (!rt || rt->panic || rt->stream_state == STREAM_STOPPING)
+		return;
+
+	if (unlikely(usb_urb->status == -ENOENT || usb_urb->status == -ENODEV ||
+		     usb_urb->status == -ECONNRESET || usb_urb->status == -ESHUTDOWN)) {
+		/* Transient unlink: stop resubmitting but do NOT panic. */
+		return;
+	}
+
+	if (unlikely(usb_urb->status))
+		goto fail;
+
+	for (i = 0; i < OZZY_ISOC_SYNC_PKTS; i++) {
+		if (usb_urb->iso_frame_desc[i].actual_length != 3)
+			rt->sync_frames[rt->sync_wr] = 255;
+		else
+			rt->sync_frames[rt->sync_wr] = sync_urb->buffer[i * 0x40 + 0];
+		rt->sync_wr++;
+	}
+
+	usb_anchor_urb(sync_urb->instance, &sync_urb->submitted);
+	ret = usb_submit_urb(sync_urb->instance, GFP_ATOMIC);
+	if (ret < 0) {
+		usb_unanchor_urb(sync_urb->instance);
+		goto fail;
+	}
+
+	return;
+
+fail:
+	ozzy_pcm_err(&chip->dev->dev, "Isoc sync URB failure\n");
+	rt->panic = true;
+}
+
+/*
+ * ozzy_pcm_isoc_out_urb_handler - Isochronous output URB completion handler.
+ * Computes this URB's packet framing via ozzy_pcm_distribute_isoc(), then
+ * copies ALSA audio (or silence) directly into the URB buffer -- isoc
+ * playback here is a plain interleaved copy, no device-specific encoding.
+ */
+static void ozzy_pcm_isoc_out_urb_handler(struct urb *usb_urb)
+{
+	struct pcm_isoc_urb *out_urb = usb_urb->context;
+	struct ozzy_chip *chip = out_urb->chip;
+	struct pcm_runtime *rt = chip->pcm;
+	struct pcm_substream *sub;
+	bool do_period_elapsed = false;
+	unsigned long flags;
+	size_t off;
+	int ret;
+
+	if (!rt || rt->panic || rt->stream_state == STREAM_STOPPING)
+		return;
+
+	sub = &rt->playback;
+
+	if (unlikely(usb_urb->status == -ENOENT || usb_urb->status == -ENODEV ||
+		     usb_urb->status == -ECONNRESET || usb_urb->status == -ESHUTDOWN)) {
+		/* Transient unlink: stop resubmitting but do NOT panic. */
+		return;
+	}
+
+	if (unlikely(usb_urb->status))
+		goto fail;
+
+	spin_lock_irqsave(&sub->lock, flags);
+
+	off = ozzy_pcm_distribute_isoc(chip, out_urb);
+
+	if (sub->active) {
+		struct snd_pcm_runtime *alsa_rt = sub->instance->runtime;
+		unsigned int pcm_buffer_size = snd_pcm_lib_buffer_bytes(sub->instance);
+
+		if (sub->dma_off + off <= pcm_buffer_size) {
+			memcpy(out_urb->buffer, alsa_rt->dma_area + sub->dma_off, off);
+		} else {
+			/* wrap around at end of ring buffer */
+			size_t len1 = pcm_buffer_size - sub->dma_off;
+			size_t len2 = off - len1;
+
+			memcpy(out_urb->buffer, alsa_rt->dma_area + sub->dma_off, len1);
+			memcpy(out_urb->buffer + len1, alsa_rt->dma_area, len2);
+		}
+
+		sub->dma_off += off;
+		if (sub->dma_off >= pcm_buffer_size)
+			sub->dma_off -= pcm_buffer_size;
+
+		sub->period_off += off;
+		if (sub->period_off >= alsa_rt->period_size) {
+			sub->period_off %= alsa_rt->period_size;
+			do_period_elapsed = true;
+		}
+	} else {
+		memset(out_urb->buffer, 0, off);
+	}
+	spin_unlock_irqrestore(&sub->lock, flags);
+
+	if (do_period_elapsed)
+		snd_pcm_period_elapsed(sub->instance);
+
+	usb_anchor_urb(out_urb->instance, &out_urb->submitted);
+	ret = usb_submit_urb(out_urb->instance, GFP_ATOMIC);
+	if (ret < 0) {
+		usb_unanchor_urb(out_urb->instance);
+		goto fail;
+	}
+
+	return;
+
+fail:
+	ozzy_pcm_err(&chip->dev->dev, "Isoc output URB failure\n");
 	rt->panic = true;
 }
 
@@ -574,12 +800,105 @@ static int ozzy_pcm_init_in_urb(struct pcm_urb *urb, struct ozzy_chip *chip)
 }
 
 /*
+ * ozzy_pcm_init_isoc_out_urb - Allocate and initialize one isoc output URB.
+ * Buffer is sized for the worst case (max rate) since isoc packet
+ * lengths vary per URB according to ozzy_pcm_distribute_isoc().
+ */
+static int ozzy_pcm_init_isoc_out_urb(struct pcm_isoc_urb *urb, struct ozzy_chip *chip)
+{
+	const struct ozzy_device_info *info = chip->info;
+	unsigned int alsa_frame_bytes = info->playback_channels * info->bytes_per_sample;
+
+	urb->chip = chip;
+	urb->instance = usb_alloc_urb(info->isoc_out_packets, GFP_KERNEL);
+	if (!urb->instance)
+		return -ENOMEM;
+
+	urb->len = alsa_frame_bytes * info->isoc_out_packets *
+		   (info->rate_max / OZZY_ISOC_UPPS + 1);
+
+	urb->buffer = usb_alloc_coherent(chip->dev, urb->len, GFP_KERNEL, &urb->dma);
+	if (!urb->buffer) {
+		usb_free_urb(urb->instance);
+		urb->instance = NULL;
+		return -ENOMEM;
+	}
+	memset(urb->buffer, 0, urb->len);
+
+	urb->instance->number_of_packets = info->isoc_out_packets;
+	urb->instance->interval = 1;
+	urb->instance->transfer_flags = URB_ISO_ASAP | URB_NO_TRANSFER_DMA_MAP;
+	urb->instance->transfer_dma = urb->dma;
+
+	usb_fill_bulk_urb(urb->instance, chip->dev,
+			  usb_sndisocpipe(chip->dev, info->isoc_out_ep),
+			  urb->buffer, 0, ozzy_pcm_isoc_out_urb_handler, urb);
+
+	if (usb_urb_ep_type_check(urb->instance)) {
+		ozzy_pcm_err(&chip->dev->dev, "Isoc output URB endpoint sanity check failed\n");
+		return -EINVAL;
+	}
+
+	init_usb_anchor(&urb->submitted);
+	return 0;
+}
+
+/*
+ * ozzy_pcm_init_isoc_sync_urb - Allocate and initialize one isoc sync URB.
+ * Each of the OZZY_ISOC_SYNC_PKTS packets carries a 3-byte feedback
+ * value in a fixed 0x40-byte slot.
+ */
+static int ozzy_pcm_init_isoc_sync_urb(struct pcm_isoc_urb *urb, struct ozzy_chip *chip)
+{
+	const struct ozzy_device_info *info = chip->info;
+	int i;
+
+	urb->chip = chip;
+	urb->instance = usb_alloc_urb(OZZY_ISOC_SYNC_PKTS, GFP_KERNEL);
+	if (!urb->instance)
+		return -ENOMEM;
+
+	urb->len = 0x40 * OZZY_ISOC_SYNC_PKTS;
+
+	urb->buffer = usb_alloc_coherent(chip->dev, urb->len, GFP_KERNEL, &urb->dma);
+	if (!urb->buffer) {
+		usb_free_urb(urb->instance);
+		urb->instance = NULL;
+		return -ENOMEM;
+	}
+	memset(urb->buffer, 0, urb->len);
+
+	for (i = 0; i < OZZY_ISOC_SYNC_PKTS; i++) {
+		urb->instance->iso_frame_desc[i].offset = i * 0x40;
+		urb->instance->iso_frame_desc[i].length = 0x03;
+	}
+
+	urb->instance->number_of_packets = OZZY_ISOC_SYNC_PKTS;
+	urb->instance->transfer_flags = URB_ISO_ASAP | URB_NO_TRANSFER_DMA_MAP;
+	urb->instance->interval = 8;
+	urb->instance->transfer_dma = urb->dma;
+
+	usb_fill_bulk_urb(urb->instance, chip->dev,
+			  usb_rcvisocpipe(chip->dev, info->isoc_sync_ep),
+			  urb->buffer, urb->len,
+			  ozzy_pcm_isoc_sync_urb_handler, urb);
+
+	if (usb_urb_ep_type_check(urb->instance)) {
+		ozzy_pcm_err(&chip->dev->dev, "Isoc sync URB endpoint sanity check failed\n");
+		return -EINVAL;
+	}
+
+	init_usb_anchor(&urb->submitted);
+	return 0;
+}
+
+/*
  * ozzy_pcm_free_urbs - Free URB buffers and reset the buffer pointers.
  *
  * Safe to call multiple times (e.g. once from an error path and again
- * from ozzy_pcm_destroy) since kfree(NULL) is a no-op. Must be called
- * with all URBs killed/poisoned first -- does not touch URB instances
- * or anchors, only the heap buffers.
+ * from ozzy_pcm_destroy) since kfree(NULL)/usb_free_urb(NULL) are
+ * no-ops. Must be called with all URBs killed/poisoned first -- does
+ * not touch anchors, only URB buffers and (for isoc) instances.
  */
 static void ozzy_pcm_free_urbs(struct pcm_runtime *rt)
 {
@@ -590,6 +909,23 @@ static void ozzy_pcm_free_urbs(struct pcm_runtime *rt)
 		rt->pcm_out_urbs[i].buffer = NULL;
 		kfree(rt->pcm_in_urbs[i].buffer);
 		rt->pcm_in_urbs[i].buffer = NULL;
+
+		if (rt->pcm_isoc_out_urbs[i].instance) {
+			usb_free_coherent(rt->chip->dev, rt->pcm_isoc_out_urbs[i].len,
+					  rt->pcm_isoc_out_urbs[i].buffer,
+					  rt->pcm_isoc_out_urbs[i].dma);
+			usb_free_urb(rt->pcm_isoc_out_urbs[i].instance);
+			rt->pcm_isoc_out_urbs[i].instance = NULL;
+			rt->pcm_isoc_out_urbs[i].buffer = NULL;
+		}
+		if (rt->pcm_isoc_sync_urbs[i].instance) {
+			usb_free_coherent(rt->chip->dev, rt->pcm_isoc_sync_urbs[i].len,
+					  rt->pcm_isoc_sync_urbs[i].buffer,
+					  rt->pcm_isoc_sync_urbs[i].dma);
+			usb_free_urb(rt->pcm_isoc_sync_urbs[i].instance);
+			rt->pcm_isoc_sync_urbs[i].instance = NULL;
+			rt->pcm_isoc_sync_urbs[i].buffer = NULL;
+		}
 	}
 }
 
@@ -616,11 +952,25 @@ int ozzy_pcm_init_urbs(struct ozzy_chip *chip)
 			goto error;
 	}
 
-	/* Initialize output URBs */
-	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
-		ret = ozzy_pcm_init_out_urb(&rt->pcm_out_urbs[i], chip);
-		if (ret < 0)
-			goto error;
+	/* Initialize output URBs -- isochronous or bulk/interrupt */
+	if (chip->info->isoc_out_packets) {
+		rt->playback.isoc_acc = 0;
+		rt->playback.isoc_rate = chip->info->rates[chip->current_rate];
+
+		for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+			ret = ozzy_pcm_init_isoc_out_urb(&rt->pcm_isoc_out_urbs[i], chip);
+			if (ret < 0)
+				goto error;
+			ret = ozzy_pcm_init_isoc_sync_urb(&rt->pcm_isoc_sync_urbs[i], chip);
+			if (ret < 0)
+				goto error;
+		}
+	} else {
+		for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+			ret = ozzy_pcm_init_out_urb(&rt->pcm_out_urbs[i], chip);
+			if (ret < 0)
+				goto error;
+		}
 	}
 
 	/* Submit all URBs */
@@ -636,14 +986,37 @@ int ozzy_pcm_init_urbs(struct ozzy_chip *chip)
 		}
 	}
 
-	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
-		usb_anchor_urb(&rt->pcm_out_urbs[i].instance,
-			       &rt->pcm_out_urbs[i].submitted);
-		ret = usb_submit_urb(&rt->pcm_out_urbs[i].instance, GFP_ATOMIC);
-		if (ret < 0) {
-			ozzy_pcm_stream_stop(rt);
-			ozzy_pcm_kill_urbs(rt);
-			goto error_locked;
+	if (chip->info->isoc_out_packets) {
+		for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+			usb_anchor_urb(rt->pcm_isoc_sync_urbs[i].instance,
+				       &rt->pcm_isoc_sync_urbs[i].submitted);
+			ret = usb_submit_urb(rt->pcm_isoc_sync_urbs[i].instance, GFP_ATOMIC);
+			if (ret < 0) {
+				ozzy_pcm_stream_stop(rt);
+				ozzy_pcm_kill_urbs(rt);
+				goto error_locked;
+			}
+		}
+		for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+			usb_anchor_urb(rt->pcm_isoc_out_urbs[i].instance,
+				       &rt->pcm_isoc_out_urbs[i].submitted);
+			ret = usb_submit_urb(rt->pcm_isoc_out_urbs[i].instance, GFP_ATOMIC);
+			if (ret < 0) {
+				ozzy_pcm_stream_stop(rt);
+				ozzy_pcm_kill_urbs(rt);
+				goto error_locked;
+			}
+		}
+	} else {
+		for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+			usb_anchor_urb(&rt->pcm_out_urbs[i].instance,
+				       &rt->pcm_out_urbs[i].submitted);
+			ret = usb_submit_urb(&rt->pcm_out_urbs[i].instance, GFP_ATOMIC);
+			if (ret < 0) {
+				ozzy_pcm_stream_stop(rt);
+				ozzy_pcm_kill_urbs(rt);
+				goto error_locked;
+			}
 		}
 	}
 	mutex_unlock(&rt->stream_mutex);
