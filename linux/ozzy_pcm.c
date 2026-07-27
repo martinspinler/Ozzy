@@ -122,14 +122,17 @@ static void ozzy_pcm_in_urb_handler(struct urb *usb_urb)
 	unsigned int bytes;
 	int ret;
 
-	if (rt->panic || rt->stream_state == STREAM_STOPPING)
+	if (!rt || rt->panic || rt->stream_state == STREAM_STOPPING)
 		return;
 
 	if (unlikely(usb_urb->status == -ENOENT ||
 		     usb_urb->status == -ENODEV ||
 		     usb_urb->status == -ECONNRESET ||
-		     usb_urb->status == -ESHUTDOWN))
-		goto in_fail;
+		     usb_urb->status == -ESHUTDOWN)) {
+		/* Transient unlink: stop resubmitting but do NOT panic --
+		 * expected during pre_reset/disconnect teardown. */
+		return;
+	}
 
 	sub = &rt->capture;
 	spin_lock_irqsave(&sub->lock, flags);
@@ -157,9 +160,12 @@ static void ozzy_pcm_in_urb_handler(struct urb *usb_urb)
 	if (do_period_elapsed)
 		snd_pcm_period_elapsed(sub->instance);
 
+	usb_anchor_urb(&in_urb->instance, &in_urb->submitted);
 	ret = usb_submit_urb(&in_urb->instance, GFP_ATOMIC);
-	if (ret < 0)
+	if (ret < 0) {
+		usb_unanchor_urb(&in_urb->instance);
 		goto in_fail;
+	}
 
 	return;
 
@@ -184,14 +190,17 @@ static void ozzy_pcm_out_urb_handler(struct urb *usb_urb)
 	unsigned int bytes;
 	int ret;
 
-	if (rt->panic || rt->stream_state == STREAM_STOPPING)
+	if (!rt || rt->panic || rt->stream_state == STREAM_STOPPING)
 		return;
 
 	if (unlikely(usb_urb->status == -ENOENT ||
 		     usb_urb->status == -ENODEV ||
 		     usb_urb->status == -ECONNRESET ||
-		     usb_urb->status == -ESHUTDOWN))
-		goto out_fail;
+		     usb_urb->status == -ESHUTDOWN)) {
+		/* Transient unlink: stop resubmitting but do NOT panic --
+		 * expected during pre_reset/disconnect teardown. */
+		return;
+	}
 
 	sub = &rt->playback;
 	spin_lock_irqsave(&sub->lock, flags);
@@ -226,9 +235,12 @@ static void ozzy_pcm_out_urb_handler(struct urb *usb_urb)
 	if (chip->ops->fill_midi_out)
 		chip->ops->fill_midi_out(chip, out_urb->buffer);
 
+	usb_anchor_urb(&out_urb->instance, &out_urb->submitted);
 	ret = usb_submit_urb(&out_urb->instance, GFP_ATOMIC);
-	if (ret < 0)
+	if (ret < 0) {
+		usb_unanchor_urb(&out_urb->instance);
 		goto out_fail;
+	}
 
 	return;
 
