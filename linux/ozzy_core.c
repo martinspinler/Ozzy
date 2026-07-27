@@ -39,6 +39,18 @@ static DEFINE_MUTEX(register_mutex);
 /* Forward declaration for usb_driver_claim_interface */
 static struct usb_driver ozzy_usb_driver;
 
+/*
+ * ozzy_card_private_free - Called by ALSA when the sound card is freed.
+ * Tears down the PCM subsystem, which may still be referenced by
+ * in-flight URB completions until this point.
+ */
+static void ozzy_card_private_free(struct snd_card *card)
+{
+	struct ozzy_chip *chip = card->private_data;
+
+	ozzy_pcm_destroy(chip);
+}
+
 /* ========================================================================
  * Device Registration Table
  * ======================================================================== */
@@ -128,6 +140,7 @@ static int ozzy_probe(struct usb_interface *intf,
 
 	chip = card->private_data;
 	chip->card = card;
+	card->private_free = ozzy_card_private_free;
 	chip->dev = device;
 	chip->info = desc->info;
 	chip->ops = desc->ops;

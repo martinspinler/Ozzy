@@ -76,4 +76,11 @@ int ozzy_pcm_init_urbs(struct ozzy_chip *chip);
  */
 void ozzy_pcm_abort(struct ozzy_chip *chip);
 
+/*
+ * ozzy_pcm_destroy - Tear down the PCM subsystem.
+ * Called via card->private_free. Kills URBs, frees URB buffers and the
+ * pcm_runtime itself. Safe to call with chip->pcm == NULL.
+ */
+void ozzy_pcm_destroy(struct ozzy_chip *chip);
+
 #endif /* OZZY_PCM_H */

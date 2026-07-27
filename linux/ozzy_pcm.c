@@ -568,8 +568,30 @@ static int ozzy_pcm_init_in_urb(struct pcm_urb *urb, struct ozzy_chip *chip)
 }
 
 /*
+ * ozzy_pcm_free_urbs - Free URB buffers and reset the buffer pointers.
+ *
+ * Safe to call multiple times (e.g. once from an error path and again
+ * from ozzy_pcm_destroy) since kfree(NULL) is a no-op. Must be called
+ * with all URBs killed/poisoned first -- does not touch URB instances
+ * or anchors, only the heap buffers.
+ */
+static void ozzy_pcm_free_urbs(struct pcm_runtime *rt)
+{
+	uint8_t i;
+
+	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+		kfree(rt->pcm_out_urbs[i].buffer);
+		rt->pcm_out_urbs[i].buffer = NULL;
+		kfree(rt->pcm_in_urbs[i].buffer);
+		rt->pcm_in_urbs[i].buffer = NULL;
+	}
+}
+
+/*
  * ozzy_pcm_init_urbs - Initialize and submit all PCM URBs.
  * Called during initial probe and after USB device reset (post_reset).
+ * Frees any URBs from a previous call first, since post_reset re-runs
+ * this on the same pcm_runtime without a matching teardown in between.
  */
 int ozzy_pcm_init_urbs(struct ozzy_chip *chip)
 {
@@ -578,6 +600,8 @@ int ozzy_pcm_init_urbs(struct ozzy_chip *chip)
 	int ret;
 
 	rt->chip = chip;
+
+	ozzy_pcm_free_urbs(rt);
 
 	/* Initialize input URBs */
 	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
@@ -624,10 +648,7 @@ error_locked:
 	mutex_unlock(&rt->stream_mutex);
 error:
 	ozzy_pcm_err(&chip->dev->dev, "PCM URB initialization failed\n");
-	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
-		kfree(rt->pcm_out_urbs[i].buffer);
-		kfree(rt->pcm_in_urbs[i].buffer);
-	}
+	ozzy_pcm_free_urbs(rt);
 	return ret;
 }
 
@@ -691,9 +712,31 @@ int ozzy_pcm_init(struct ozzy_chip *chip)
 	ret = ozzy_pcm_init_urbs(chip);
 	if (ret < 0) {
 		ozzy_pcm_err(&chip->dev->dev, "PCM URB setup failed\n");
+		chip->pcm = NULL;
 		kfree(rt);
 		return ret;
 	}
 
 	return 0;
+}
+
+/*
+ * ozzy_pcm_destroy - Tear down the PCM subsystem.
+ * Called via card->private_free. Ensures URBs are dead before freeing
+ * their buffers and the pcm_runtime itself.
+ */
+void ozzy_pcm_destroy(struct ozzy_chip *chip)
+{
+	struct pcm_runtime *rt = chip->pcm;
+
+	if (!rt)
+		return;
+
+	/* Make sure no completion handler is running before we free buffers */
+	rt->panic = true;
+	ozzy_pcm_kill_urbs(rt);
+	ozzy_pcm_free_urbs(rt);
+
+	chip->pcm = NULL;
+	kfree(rt);
 }
