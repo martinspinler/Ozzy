@@ -244,13 +244,25 @@ err_submit:
 
 static int xonedb4_pcm_set_rate(struct pcm_runtime *rt)
 {
+	int ret;
+
 	rt->chip->alsarate = rt->rate;
 
 	if (rt->chip->alsarate != rt->chip->devicerate) {
-		dev_notice(&rt->chip->dev->dev, "%s: Resetting device for samplerate change %d -> %d\n", __func__, rates[rt->chip->devicerate], rates[rt->chip->alsarate]);
-		mutex_unlock(&rt->stream_mutex);
-		xonedb4_reset(rt->chip);
-		mutex_lock(&rt->stream_mutex);
+		dev_notice(&rt->chip->dev->dev, "%s: Changing samplerate %d -> %d via control messages\n",
+			   __func__, rates[rt->chip->devicerate], rates[rt->chip->alsarate]);
+
+		ret = xonedb4_set_samplerate(rt->chip);
+		if (ret < 0) {
+			dev_err(&rt->chip->dev->dev, "%s: Failed to set samplerate: %d\n", __func__, ret);
+			return ret;
+		}
+
+		ret = xonedb4_get_samplerate(rt->chip);
+		if (ret < 0) {
+			dev_err(&rt->chip->dev->dev, "%s: Failed to verify samplerate: %d\n", __func__, ret);
+			return ret;
+		}
 	}
 
 	return 0;
