@@ -182,14 +182,63 @@ static void xonedb4_pcm_kill_urbs(struct pcm_runtime *rt)
 /* call with stream_mutex locked */
 static int xonedb4_pcm_stream_start(struct pcm_runtime *rt)
 {
-	int ret = 0;
-	
+	int i;
+	int ret;
+
 	if (rt->stream_state == STREAM_DISABLED) {
 		/* reset panic state when starting a new stream */
 		rt->panic = false;
+
+		/* Reset sync ring buffer */
+		rt->sync_rd = 0;
+		rt->sync_wr = 0;
+
+		/* Reset ISOC accumulator to nominal rate for current device rate */
+		rt->playback.isoc_rate = rates[rt->chip->devicerate];
+		rt->playback.isoc_acc = 0;
+
 		rt->stream_state = STREAM_STARTING;
+
+		/* Submit sync URBs first so feedback is ready when out URBs start */
+		for (i = 0; i < PCM_N_URBS; i++) {
+			if (rt->pcm_sync_urbs[i].instance) {
+				usb_anchor_urb(rt->pcm_sync_urbs[i].instance, &rt->pcm_sync_urbs[i].submitted);
+				ret = usb_submit_urb(rt->pcm_sync_urbs[i].instance, GFP_ATOMIC);
+				if (ret < 0) {
+					usb_unanchor_urb(rt->pcm_sync_urbs[i].instance);
+					goto err_submit;
+				}
+			}
+		}
+
+		/* Submit input URBs */
+		for (i = 0; i < PCM_N_URBS; i++) {
+			usb_anchor_urb(rt->pcm_in_urbs[i].instance, &rt->pcm_in_urbs[i].submitted);
+			ret = usb_submit_urb(rt->pcm_in_urbs[i].instance, GFP_ATOMIC);
+			if (ret < 0) {
+				usb_unanchor_urb(rt->pcm_in_urbs[i].instance);
+				goto err_submit;
+			}
+		}
+
+		/* Submit output URBs */
+		for (i = 0; i < PCM_N_URBS; i++) {
+			usb_anchor_urb(rt->pcm_out_urbs[i].instance, &rt->pcm_out_urbs[i].submitted);
+			ret = usb_submit_urb(rt->pcm_out_urbs[i].instance, GFP_ATOMIC);
+			if (ret < 0) {
+				usb_unanchor_urb(rt->pcm_out_urbs[i].instance);
+				goto err_submit;
+			}
+		}
+
 		rt->stream_state = STREAM_RUNNING;
 	}
+	return 0;
+
+err_submit:
+	xonedb4_pcm_kill_urbs(rt);
+	rt->stream_state = STREAM_DISABLED;
+	dev_err(&rt->chip->dev->dev, "%s: URB submission failed\n", __func__);
 	return ret;
 }
 
@@ -1298,36 +1347,8 @@ int xonedb4_pcm_init_urbs(struct xonedb4_chip *chip)
 		}
 	}
 
-	mutex_lock(&rt->stream_mutex);
-	for (i = 0; i < PCM_N_URBS; i++) {
-		usb_anchor_urb(rt->pcm_in_urbs[i].instance, &rt->pcm_in_urbs[i].submitted);
-		ret = usb_submit_urb(rt->pcm_in_urbs[i].instance, GFP_ATOMIC);
-		if (ret < 0)
-			goto err_submit;
-	}
-
-	for (i = 0; i < PCM_N_URBS; i++) {
-		usb_anchor_urb(rt->pcm_out_urbs[i].instance, &rt->pcm_out_urbs[i].submitted);
-		ret = usb_submit_urb(rt->pcm_out_urbs[i].instance, GFP_ATOMIC);
-		if (ret < 0)
-			goto err_submit;
-	}
-	for (i = 0; i < PCM_N_URBS; i++) {
-		if (rt->pcm_sync_urbs[i].instance) {
-			usb_anchor_urb(rt->pcm_sync_urbs[i].instance, &rt->pcm_sync_urbs[i].submitted);
-			ret = usb_submit_urb(rt->pcm_sync_urbs[i].instance, GFP_ATOMIC);
-			if (ret < 0)
-				goto err_submit;
-		}
-	}
-	mutex_unlock(&rt->stream_mutex);
-	
 	return 0;
 
-err_submit:
-	xonedb4_pcm_stream_stop(rt);
-	xonedb4_pcm_kill_urbs(rt);
-	mutex_unlock(&rt->stream_mutex);
 error:
 	dev_err(&chip->dev->dev, "%s: ERROR\n", __func__);
 	xonedb4_pcm_free_urbs(rt);
