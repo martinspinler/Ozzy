@@ -493,14 +493,16 @@ static void xonedb4_pcm_in_urb_handler(struct urb *usb_urb)
 	unsigned long flags;
 	int ret;
 
-	if (rt->panic || rt->stream_state == STREAM_STOPPING)
+	if (!rt || rt->panic || rt->stream_state == STREAM_STOPPING)
 		return;
 
 	if (unlikely(usb_urb->status == -ENOENT ||	/* unlinked */
 		     usb_urb->status == -ENODEV ||	/* device removed */
 		     usb_urb->status == -ECONNRESET ||	/* unlinked */
 		     usb_urb->status == -ESHUTDOWN)) {	/* device disabled */
-		goto in_fail;
+		/* Transient errors: stop resubmitting but do NOT set panic.
+		 * The stream will be restarted by stream_start on next open. */
+		return;
 	}
 
 	sub = &rt->capture;
@@ -516,10 +518,13 @@ static void xonedb4_pcm_in_urb_handler(struct urb *usb_urb)
 		snd_pcm_period_elapsed(sub->instance);
 	}
 
+	usb_anchor_urb(in_urb->instance, &in_urb->submitted);
 	ret = usb_submit_urb(in_urb->instance, GFP_ATOMIC);
 
-	if (ret < 0)
+	if (ret < 0) {
+		usb_unanchor_urb(in_urb->instance);
 		goto in_fail;
+	}
 
 	return;
 
@@ -686,12 +691,16 @@ static void xonedb4_pcm_bulk_out_urb_handler(struct urb *usb_urb)
 	unsigned long flags;
 	int ret;
 
-	if (rt->panic || rt->stream_state == STREAM_STOPPING)
+	if (!rt || rt->panic || rt->stream_state == STREAM_STOPPING)
 		return;
 
 	if (unlikely(usb_urb->status == -ENOENT || usb_urb->status == -ENODEV || usb_urb->status == -ECONNRESET || usb_urb->status == -ESHUTDOWN)) {
-		goto out_fail;
+		/* Transient errors: stop resubmitting but do NOT set panic. */
+		return;
 	}
+
+	if (unlikely(usb_urb->status))
+		goto out_fail;
 
 	sub = &rt->playback;
 
@@ -715,10 +724,13 @@ static void xonedb4_pcm_bulk_out_urb_handler(struct urb *usb_urb)
 	xonedb4_get_midi_output(out_urb->buffer + 1504, 1);
 	xonedb4_get_midi_output(out_urb->buffer + 2016, 1);
 
+	usb_anchor_urb(out_urb->instance, &out_urb->submitted);
 	ret = usb_submit_urb(out_urb->instance, GFP_ATOMIC);
 
-	if (ret < 0)
+	if (ret < 0) {
+		usb_unanchor_urb(out_urb->instance);
 		goto out_fail;
+	}
 
 	return;
 
@@ -736,12 +748,16 @@ static void xonedb4_pcm_int_out_urb_handler(struct urb *usb_urb)
 	unsigned long flags;
 	int ret;
 
-	if (rt->panic || rt->stream_state == STREAM_STOPPING)
+	if (!rt || rt->panic || rt->stream_state == STREAM_STOPPING)
 		return;
 
 	if (unlikely(usb_urb->status == -ENOENT || usb_urb->status == -ENODEV || usb_urb->status == -ECONNRESET || usb_urb->status == -ESHUTDOWN)) {
-		goto out_fail;
+		/* Transient errors: stop resubmitting but do NOT set panic. */
+		return;
 	}
+
+	if (unlikely(usb_urb->status))
+		goto out_fail;
 
 	sub = &rt->playback;
 
@@ -766,10 +782,13 @@ static void xonedb4_pcm_int_out_urb_handler(struct urb *usb_urb)
 	xonedb4_get_midi_output(out_urb->buffer + 1396, 2);
 	xonedb4_get_midi_output(out_urb->buffer + 1878, 2);
 
+	usb_anchor_urb(out_urb->instance, &out_urb->submitted);
 	ret = usb_submit_urb(out_urb->instance, GFP_ATOMIC);
-	
-	if (ret < 0)
+
+	if (ret < 0) {
+		usb_unanchor_urb(out_urb->instance);
 		goto out_fail;
+	}
 
 	return;
 
