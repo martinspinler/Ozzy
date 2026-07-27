@@ -179,31 +179,6 @@ static void xonedb4_pcm_kill_urbs(struct pcm_runtime *rt)
 	}
 }
 
-static void xonedb4_pcm_poison_urbs(struct pcm_runtime *rt)
-{
-	int i, time;
-
-	for (i = 0; i < PCM_N_URBS; i++) {
-		time = usb_wait_anchor_empty_timeout(&rt->pcm_in_urbs[i].submitted, 100);
-		if (!time) {
-			usb_kill_anchored_urbs(&rt->pcm_in_urbs[i].submitted);
-		}
-		time = usb_wait_anchor_empty_timeout(&rt->pcm_out_urbs[i].submitted, 100);
-		if (!time) {
-			usb_kill_anchored_urbs(&rt->pcm_out_urbs[i].submitted);
-		}
-		if (rt->pcm_sync_urbs[i].instance) {
-			time = usb_wait_anchor_empty_timeout(&rt->pcm_sync_urbs[i].submitted, 100);
-			if (!time) {
-				usb_kill_anchored_urbs(&rt->pcm_sync_urbs[i].submitted);
-			}
-			usb_poison_urb(rt->pcm_sync_urbs[i].instance);
-		}
-		usb_poison_urb(rt->pcm_in_urbs[i].instance);
-		usb_poison_urb(rt->pcm_out_urbs[i].instance);
-	}
-}
-
 /* call with stream_mutex locked */
 static int xonedb4_pcm_stream_start(struct pcm_runtime *rt)
 {
@@ -1002,8 +977,11 @@ void xonedb4_pcm_abort(struct xonedb4_chip *chip)
 	if (rt) {
 		rt->panic = true;
 
-		xonedb4_pcm_stream_stop(rt);
-		xonedb4_pcm_poison_urbs(rt);
+		/* Use kill_urbs (synchronous) instead of poison_urbs (asynchronous)
+		 * to guarantee all URB handlers have finished before we return.
+		 * The caller (disconnect) expects hardware to be fully quiesced
+		 * so that subsequent cleanup won't race with in-flight callbacks. */
+		xonedb4_pcm_kill_urbs(rt);
 	}
 }
 
