@@ -36,13 +36,17 @@ static struct pcm_substream *ozzy_pcm_get_substream(struct snd_pcm_substream *al
 	return NULL;
 }
 
+static void ozzy_pcm_kill_urbs(struct pcm_runtime *rt);
+
 /*
  * ozzy_pcm_stream_stop - Transition stream to disabled state.
+ * Kills all URBs so none are left running once the stream is DISABLED.
  */
 static void ozzy_pcm_stream_stop(struct pcm_runtime *rt)
 {
 	if (rt->stream_state != STREAM_DISABLED) {
 		rt->stream_state = STREAM_STOPPING;
+		ozzy_pcm_kill_urbs(rt);
 		rt->stream_state = STREAM_DISABLED;
 	}
 }
@@ -81,25 +85,6 @@ static void ozzy_pcm_kill_urbs(struct pcm_runtime *rt)
 			usb_kill_anchored_urbs(&rt->pcm_out_urbs[i].submitted);
 		usb_kill_urb(&rt->pcm_in_urbs[i].instance);
 		usb_kill_urb(&rt->pcm_out_urbs[i].instance);
-	}
-}
-
-/*
- * ozzy_pcm_poison_urbs - Poison all PCM URBs (prevents resubmission).
- */
-static void ozzy_pcm_poison_urbs(struct pcm_runtime *rt)
-{
-	int i, time;
-
-	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
-		time = usb_wait_anchor_empty_timeout(&rt->pcm_in_urbs[i].submitted, 100);
-		if (!time)
-			usb_kill_anchored_urbs(&rt->pcm_in_urbs[i].submitted);
-		time = usb_wait_anchor_empty_timeout(&rt->pcm_out_urbs[i].submitted, 100);
-		if (!time)
-			usb_kill_anchored_urbs(&rt->pcm_out_urbs[i].submitted);
-		usb_poison_urb(&rt->pcm_in_urbs[i].instance);
-		usb_poison_urb(&rt->pcm_out_urbs[i].instance);
 	}
 }
 
@@ -670,7 +655,9 @@ error:
 
 /*
  * ozzy_pcm_abort - Emergency stop all PCM activity.
- * Sets panic flag and poisons all URBs to prevent resubmission.
+ * Sets panic flag and synchronously kills all URBs so the caller
+ * (disconnect/pre_reset) can rely on the hardware being fully
+ * quiesced before it proceeds, regardless of stream_state.
  */
 void ozzy_pcm_abort(struct ozzy_chip *chip)
 {
@@ -678,8 +665,7 @@ void ozzy_pcm_abort(struct ozzy_chip *chip)
 
 	if (rt) {
 		rt->panic = true;
-		ozzy_pcm_stream_stop(rt);
-		ozzy_pcm_poison_urbs(rt);
+		ozzy_pcm_kill_urbs(rt);
 	}
 }
 
