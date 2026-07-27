@@ -245,7 +245,7 @@ static int xonedb4_probe(struct usb_interface *intf, const struct usb_device_id 
 	/* get firmware */
 	ret = xonedb4_get_firmware_ver(chip);
 	if (ret < 0) {
-		goto err;
+		goto err_chip_destroy;
 	}
 
 	dev_info(&device->dev, "%s: Ploytec firmware version: 1.%d.%d\n", __func__, chip->firmwarever[2]/10, chip->firmwarever[2]%10);
@@ -301,11 +301,13 @@ static int xonedb4_probe(struct usb_interface *intf, const struct usb_device_id 
 	usb_set_intfdata(intf, chip);
 	return 0;
 
-err_chip_destroy:
-	snd_card_free(chip->card);
-err:
-	mutex_unlock(&register_mutex);
-	return ret;
+	err_chip_destroy:
+		snd_card_free(chip->card);
+		return ret;
+
+	err:
+		mutex_unlock(&register_mutex);
+		return ret;
 }
 
 static void xonedb4_disconnect(struct usb_interface *intf)
