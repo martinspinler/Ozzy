@@ -30,9 +30,6 @@ static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
 
-int cardindex;
-bool justresetting = false;
-
 #define DRIVER_NAME "snd-usb-xonedb4"
 
 static DEFINE_MUTEX(register_mutex);
@@ -73,23 +70,6 @@ int xonedb4_send_resets(struct xonedb4_chip *chip)
 	ret = usb_control_msg(chip->dev, usb_rcvctrlpipe(chip->dev, 0), 0x1, 0x02, 0x0000, 0x05, NULL, 0, 2000);
 	
 	return ret;
-}
-
-int xonedb4_reset(struct xonedb4_chip *chip)
-{
-	dev_notice(&chip->dev->dev, "%s: Resetting device", __func__);
-
-	int ret;
-
-	justresetting = true;
-
-	ret = usb_reset_device(chip->dev);
-	if (ret < 0) {
-		dev_err(&chip->dev->dev, "%s: Reset failed!\n", __func__);
-		return ret;
-	}
-
-	return 0;
 }
 
 int xonedb4_set_samplerate(struct xonedb4_chip *chip)
@@ -223,62 +203,6 @@ static int xonedb4_probe(struct usb_interface *intf, const struct usb_device_id 
 		return -EIO;
 	}
 
-	if (justresetting == true) {
-		card = snd_card_ref(cardindex);
-		chip = card->private_data;
-		chip->card = card;
-		chip->dev = device;
-		justresetting = false;
-	
-		// get status
-		ret = xonedb4_get_status(chip);
-		if (ret < 0) {
-			goto err_chip_destroy;
-		}
-		// get samplerate
-		ret = xonedb4_get_samplerate(chip);
-		if (ret < 0) {
-			goto err_chip_destroy;
-		}
-		// set samplerate
-		ret = xonedb4_set_samplerate(chip);
-		if (ret < 0) {
-			goto err_chip_destroy;
-		}
-		// get samplerate
-		ret = xonedb4_get_samplerate(chip);
-		if (ret < 0) {
-			goto err_chip_destroy;
-		}
-		// get status
-		ret = xonedb4_get_status(chip);
-		if (ret < 0) {
-			goto err_chip_destroy;
-		}
-		// send allgood
-		ret = xonedb4_send_allgood(chip);
-		if (ret < 0) {
-			goto err_chip_destroy;
-		}
-
-		if (chip->cfg->have_midi) {
-			ret = xonedb4_midi_init_bulk_urbs(chip);
-			if (ret < 0) {
-				dev_err(&device->dev, "%s: MIDI fail!\n", __func__);
-				goto err_chip_destroy;
-			}
-		}
-		ret = xonedb4_pcm_init_urbs(chip);
-		if (ret < 0) {
-			dev_err(&device->dev, "%s: PCM fail!\n", __func__);
-			goto err_chip_destroy;
-		}
-
-		usb_set_intfdata(intf, chip);
-
-		return 0;
-	}
-	
 	dev_info(&device->dev, "%s: Found device: %s\n", __func__, device->product);
 
 	mutex_lock(&register_mutex);
@@ -302,8 +226,6 @@ static int xonedb4_probe(struct usb_interface *intf, const struct usb_device_id 
 		dev_err(&device->dev, "%s: Cannot create ALSA card!\n", __func__);
 		return ret;
 	}
-
-	cardindex = card->number;
 
 	strscpy(card->driver, DRIVER_NAME, sizeof(card->driver));
 	strscpy(card->shortname, device->product, sizeof(card->shortname));
@@ -406,10 +328,8 @@ static void xonedb4_disconnect(struct usb_interface *intf)
 	xonedb4_pcm_abort(chip);
 	if (chip->cfg->have_midi)
 		xonedb4_midi_abort(chip);
-	if (justresetting == false) {
-		snd_card_disconnect(chip->card);
-		snd_card_free_when_closed(chip->card);
-	}
+	snd_card_disconnect(chip->card);
+	snd_card_free_when_closed(chip->card);
 }
 
 static const struct usb_device_id device_table[] = {

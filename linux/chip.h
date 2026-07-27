@@ -27,7 +27,6 @@ struct xonedb4_chip {
 };
 
 int xonedb4_get_firmware_ver(struct xonedb4_chip *chip);
-int xonedb4_reset(struct xonedb4_chip *chip);
 int xonedb4_set_samplerate(struct xonedb4_chip *chip);
 int xonedb4_send_allgood(struct xonedb4_chip *chip);
 int xonedb4_send_resets(struct xonedb4_chip *chip);
