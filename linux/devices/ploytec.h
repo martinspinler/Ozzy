@@ -13,4 +13,7 @@
 extern const struct ozzy_device_info ploytec_info;
 extern const struct ozzy_device_ops ploytec_ops;
 
+/* Alesis MultiMix 8: same ploytec_ops, isochronous playback topology */
+extern const struct ozzy_device_info alesis8_info;
+
 #endif /* OZZY_PLOYTEC_H */

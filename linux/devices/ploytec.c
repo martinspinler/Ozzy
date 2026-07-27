@@ -544,3 +544,41 @@ const struct ozzy_device_ops ploytec_ops = {
 	.fill_midi_out       = ploytec_fill_midi_out,
 	.get_out_packet_size = ploytec_get_out_packet_size,
 };
+
+/*
+ * Alesis MultiMix 8 -- same Ploytec chipset and vendor-request handshake
+ * (firmware/status/rate control all reuse ploytec_ops unchanged), but its
+ * firmware runs playback over isochronous endpoints instead of
+ * bulk/interrupt, with a separate feedback (sync) endpoint. Capture stays
+ * on the standard Ploytec bulk/interrupt input path and codec, so only
+ * the playback topology differs from ploytec_info. Has no MIDI.
+ */
+#define ALESIS8_PLAYBACK_CHANNELS  2
+#define ALESIS8_EP_ISOC_OUT        0x02
+#define ALESIS8_EP_ISOC_SYNC       0x01
+#define ALESIS8_ISOC_OUT_PACKETS   40
+
+const struct ozzy_device_info alesis8_info = {
+	.name                  = "Alesis MultiMix 8 (Ploytec)",
+	.playback_channels     = ALESIS8_PLAYBACK_CHANNELS,
+	.capture_channels      = PLOYTEC_CHANNELS,
+	.in_packet_size        = PLOYTEC_IN_PKT_SIZE,
+	/* 40 packets/URB * (96000Hz max rate / 8000 USB packets-per-sec) */
+	.frames_per_out_packet = ALESIS8_ISOC_OUT_PACKETS * (96000 / 8000),
+	.frames_per_in_packet  = PLOYTEC_FRAMES_PER_PKT,
+	.in_ep                 = PLOYTEC_EP_PCM_IN,
+	.isoc_out_ep           = ALESIS8_EP_ISOC_OUT,
+	.isoc_sync_ep          = ALESIS8_EP_ISOC_SYNC,
+	.isoc_out_packets      = ALESIS8_ISOC_OUT_PACKETS,
+	.alsa_format           = SNDRV_PCM_FMTBIT_S24_3LE,
+	.bytes_per_sample      = 3,
+	.midi_in_ep            = 0,
+	.midi_out_embedded     = false,
+	.num_interfaces        = PLOYTEC_NUM_INTERFACES,
+	.alt_setting           = PLOYTEC_ALT_SETTING,
+	.rates                 = ploytec_rates,
+	.num_rates             = ARRAY_SIZE(ploytec_rates),
+	.rates_mask            = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000,
+	.rate_min              = 44100,
+	.rate_max              = 96000,
+};

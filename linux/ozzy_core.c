@@ -60,12 +60,18 @@ static const struct ozzy_device_desc ploytec_desc = {
 	.ops  = &ploytec_ops,
 };
 
+static const struct ozzy_device_desc alesis8_desc = {
+	.info = &alesis8_info,
+	.ops  = &ploytec_ops,
+};
+
 static const struct usb_device_id ozzy_id_table[] = {
 	{ USB_DEVICE(0x0a4a, 0xffdb), .driver_info = (kernel_ulong_t)&ploytec_desc }, /* Xone:DB4 */
 	{ USB_DEVICE(0x0a4a, 0xffd2), .driver_info = (kernel_ulong_t)&ploytec_desc }, /* Xone:DB2 */
 	{ USB_DEVICE(0x0a4a, 0xffdd), .driver_info = (kernel_ulong_t)&ploytec_desc }, /* Xone:DX */
 	{ USB_DEVICE(0x0a4a, 0xff4d), .driver_info = (kernel_ulong_t)&ploytec_desc }, /* Xone:4D */
 	{ USB_DEVICE(0x0a4a, 0xffad), .driver_info = (kernel_ulong_t)&ploytec_desc }, /* Wizard 4 */
+	{ USB_DEVICE(0x13b2, 0x0030), .driver_info = (kernel_ulong_t)&alesis8_desc }, /* Alesis MultiMix 8 */
 	{}
 };
 MODULE_DEVICE_TABLE(usb, ozzy_id_table);
