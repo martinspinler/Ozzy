@@ -249,11 +249,29 @@ static int ozzy_pcm_open(struct snd_pcm_substream *alsa_sub)
 	const struct ozzy_device_info *info = chip->info;
 	struct pcm_substream *sub;
 	struct snd_pcm_runtime *alsa_rt = alsa_sub->runtime;
-	unsigned int alsa_frame_bytes = info->playback_channels * info->bytes_per_sample;
-	unsigned int alsa_pkt_bytes = info->frames_per_out_packet * alsa_frame_bytes;
+	unsigned int channels, frames_per_packet, alsa_frame_bytes, alsa_pkt_bytes;
 
 	if (rt->panic)
 		return -EPIPE;
+
+	if (alsa_sub->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		sub = &rt->playback;
+		channels = info->playback_channels;
+		frames_per_packet = info->frames_per_out_packet;
+	} else if (alsa_sub->stream == SNDRV_PCM_STREAM_CAPTURE) {
+		sub = &rt->capture;
+		channels = info->capture_channels;
+		frames_per_packet = info->frames_per_in_packet;
+	} else {
+		return -EINVAL;
+	}
+
+	/* Playback and capture channel counts (and thus packet sizing) can
+	 * differ -- e.g. a device with stereo isoc playback but 8-channel
+	 * capture -- so compute these per-stream rather than always from
+	 * the playback topology. */
+	alsa_frame_bytes = channels * info->bytes_per_sample;
+	alsa_pkt_bytes = frames_per_packet * alsa_frame_bytes;
 
 	mutex_lock(&rt->stream_mutex);
 
@@ -267,22 +285,13 @@ static int ozzy_pcm_open(struct snd_pcm_substream *alsa_sub)
 	alsa_rt->hw.rates = info->rates_mask;
 	alsa_rt->hw.rate_min = info->rate_min;
 	alsa_rt->hw.rate_max = info->rate_max;
-	alsa_rt->hw.channels_min = info->playback_channels;
-	alsa_rt->hw.channels_max = info->playback_channels;
+	alsa_rt->hw.channels_min = channels;
+	alsa_rt->hw.channels_max = channels;
 	alsa_rt->hw.buffer_bytes_max = 2000 * alsa_pkt_bytes;
 	alsa_rt->hw.period_bytes_min = 2 * alsa_pkt_bytes;
 	alsa_rt->hw.period_bytes_max = 2000 * alsa_pkt_bytes;
 	alsa_rt->hw.periods_min = 2;
 	alsa_rt->hw.periods_max = 1024;
-
-	if (alsa_sub->stream == SNDRV_PCM_STREAM_PLAYBACK)
-		sub = &rt->playback;
-	else if (alsa_sub->stream == SNDRV_PCM_STREAM_CAPTURE)
-		sub = &rt->capture;
-	else {
-		mutex_unlock(&rt->stream_mutex);
-		return -EINVAL;
-	}
 
 	sub->instance = alsa_sub;
 	sub->active = false;
