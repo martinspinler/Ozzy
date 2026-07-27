@@ -816,7 +816,15 @@ static int xonedb4_pcm_open_out(struct snd_pcm_substream *alsa_sub)
 	alsa_rt->hw.buffer_bytes_max = 256 * rt->pcm_out_urbs[0].len;
 
 	rt->rate = XONEDB4_PCM_RATE_INVAL;
-	alsa_rt->hw.rates = rates_alsaid[rt->rate];
+
+	/* Compute supported rates mask from the rates table */
+	{
+		int r;
+		unsigned int rates_mask = 0;
+		for (r = 0; r < XONEDB4_RATES_COUNT; r++)
+			rates_mask |= rates_alsaid[r];
+		alsa_rt->hw.rates = rates_mask;
+	}
 
 	if (!sub) {
 		mutex_unlock(&rt->stream_mutex);
@@ -849,7 +857,15 @@ static int xonedb4_pcm_open(struct snd_pcm_substream *alsa_sub)
 	}
 
 	rt->rate = XONEDB4_PCM_RATE_INVAL;
-	alsa_rt->hw.rates = rates_alsaid[rt->rate];
+
+	/* Compute supported rates mask from the rates table */
+	{
+		int r;
+		unsigned int rates_mask = 0;
+		for (r = 0; r < XONEDB4_RATES_COUNT; r++)
+			rates_mask |= rates_alsaid[r];
+		alsa_rt->hw.rates = rates_mask;
+	}
 
 	if (!sub) {
 		mutex_unlock(&rt->stream_mutex);
